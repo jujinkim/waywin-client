@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "environment": {
+    "ubuntu": "",
+    "gnome": "",
+    "sdl_driver": "",
+    "windows_edition_build": "",
+    "rdp_policy": "",
+    "freerdp_commit": "",
+    "patch_sha256": ""
+  },
+  "tester": "",
+  "date": "",
+  "applications": [],
+  "cases": {
+    "P01": {
+      "description": "Native Wayland: display, move, resize, input, popups",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "required": true
+    },
+    "P02": {
+      "description": "Existing AND new windows discovered; representative app inventory",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "required": true
+    },
+    "P03": {
+      "description": "Occluded/minimized windows restore and repaint",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "required": true
+    },
+    "P04": {
+      "description": "Tray create/update/delete AND click/context menu",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "required": true
+    },
+    "P05": {
+      "description": "Helper launch AND desktop/seamless switch preserves session and work",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "required": true
+    },
+    "P06": {
+      "description": "Disconnect/recovery without duplicate launch or logoff",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "required": true
+    },
+    "P07": {
+      "description": "Two sessions: stopping/killing one leaves the other responsive",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "required": true
+    },
+    "P08": {
+      "description": "Mixed/duplicate desktop and selected windows (optional)",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "required": false
+    }
+  }
+}

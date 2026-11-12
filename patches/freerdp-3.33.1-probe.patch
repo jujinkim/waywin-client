@@ -1,0 +1,106 @@
+diff --git a/client/SDL/SDL3/sdl_rail.cpp b/client/SDL/SDL3/sdl_rail.cpp
+index 1a927e3..ef1516f 100644
+--- a/client/SDL/SDL3/sdl_rail.cpp
++++ b/client/SDL/SDL3/sdl_rail.cpp
+@@ -17,6 +17,9 @@
+  * limitations under the License.
+  */
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <tuple>
+ #include <utility>
+ #include <vector>
+@@ -40,6 +43,25 @@
+ 
+ #define TAG CLIENT_TAG("sdl.rail")
+ 
++/* WayWin stage-0 observer only. No titles, pixels, input or icon payloads.
++ * Receiving an order is NOT evidence of rendering or interaction support. */
++static bool waywinProbeEnabled()
++{
++	const char* value = std::getenv("WAYWIN_PROBE_EVENTS");
++	return value && (std::strcmp(value, "1") == 0);
++}
++
++static void waywinProbeEvent(const char* type, const WINDOW_ORDER_INFO* info)
++{
++	if (waywinProbeEnabled() && info)
++		std::fprintf(stderr, "WAYWIN_PROBE_V1 type=%s window=%" PRIu32
++		             " icon=%" PRIu32 " flags=%" PRIu32 "\n",
++		             type, (info->fieldFlags & (WINDOW_ORDER_TYPE_WINDOW | WINDOW_ORDER_TYPE_NOTIFY))
++		                 ? info->windowId : 0,
++		             (info->fieldFlags & WINDOW_ORDER_TYPE_NOTIFY) ? info->notifyIconId : 0,
++		             info->fieldFlags);
++}
++
+ /* The compositor runs the drag (Wayland); the client only tracks the size. */
+ [[nodiscard]] static bool compositorDrag()
+ {
+@@ -854,6 +876,8 @@ bool SdlRail::init(RailClientContext* rail)
+ 	/* Keep default ServerHandshake. */
+ 
+ 	WLog_WARN(TAG, "RemoteApp/RAIL support in the SDL client is experimental");
++	if (waywinProbeEnabled())
++		std::fprintf(stderr, "WAYWIN_PROBE_V1 driver=%s\n", SDL_GetCurrentVideoDriver());
+ 	{
+ 		std::unique_lock lock(_windowsLock);
+ 		updateCoordinates();
+@@ -942,6 +966,23 @@ void SdlRail::registerUpdateCallbacks(rdpUpdate* update)
+ 	window->WindowDelete = SdlRail::window_delete;
+ 	window->MonitoredDesktop = SdlRail::monitored_desktop;
+ 	window->NonMonitoredDesktop = SdlRail::non_monitored_desktop;
++	if (waywinProbeEnabled())
++	{
++		window->NotifyIconCreate = [](rdpContext*, const WINDOW_ORDER_INFO* info,
++		                             const NOTIFY_ICON_STATE_ORDER*) -> BOOL {
++			waywinProbeEvent("notify-create", info);
++			return TRUE;
++		};
++		window->NotifyIconUpdate = [](rdpContext*, const WINDOW_ORDER_INFO* info,
++		                             const NOTIFY_ICON_STATE_ORDER*) -> BOOL {
++			waywinProbeEvent("notify-update", info);
++			return TRUE;
++		};
++		window->NotifyIconDelete = [](rdpContext*, const WINDOW_ORDER_INFO* info) -> BOOL {
++			waywinProbeEvent("notify-delete", info);
++			return TRUE;
++		};
++	}
+ }
+ 
+ /* --- server callbacks --- */
+@@ -1724,6 +1765,8 @@ BOOL SdlRail::window_common(rdpContext* context, const WINDOW_ORDER_INFO* orderI
+                             const WINDOW_STATE_ORDER* windowState)
+ {
+ 	WINPR_ASSERT(orderInfo);
++	if (orderInfo->fieldFlags & WINDOW_ORDER_STATE_NEW)
++		waywinProbeEvent("window-create", orderInfo);
+ 	WINPR_ASSERT(windowState);
+ 	auto rail = SdlRail::get(context);
+ 	if (!rail)
+@@ -1932,6 +1975,7 @@ BOOL SdlRail::window_cached_icon(rdpContext* context, const WINDOW_ORDER_INFO* o
+ BOOL SdlRail::window_delete(rdpContext* context, const WINDOW_ORDER_INFO* orderInfo)
+ {
+ 	WINPR_ASSERT(orderInfo);
++	waywinProbeEvent("window-delete", orderInfo);
+ 	auto rail = SdlRail::get(context);
+ 	if (!rail)
+ 		return FALSE;
+@@ -1969,6 +2013,7 @@ BOOL SdlRail::monitored_desktop(rdpContext* context, const WINDOW_ORDER_INFO* or
+ 	/* Launch the RemoteApp on DESKTOP_ARC_COMPLETED, like xf_rail_monitored_desktop. */
+ 	if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_DESKTOP_ARC_COMPLETED)
+ 	{
++		waywinProbeEvent("desktop-monitored", orderInfo);
+ 		rail->enableRemoteAppMode(true);
+ 		const char* app =
+ 		    freerdp_settings_get_string(context->settings, FreeRDP_RemoteApplicationProgram);
+@@ -2017,6 +2062,7 @@ BOOL SdlRail::non_monitored_desktop(rdpContext* context,
+ 	auto rail = SdlRail::get(context);
+ 	if (rail)
+ 	{
++		waywinProbeEvent("desktop-unmonitored", orderInfo);
+ 		WLog_DBG(TAG, "RAIL mode disabled (non-monitored desktop)");
+ 		rail->enableRemoteAppMode(false);
+ 	}

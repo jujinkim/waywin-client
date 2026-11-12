@@ -7,6 +7,9 @@ Windows RDP 사용자 세션의 창과 셸 기능을 Ubuntu GNOME Wayland에 통
 - [기획·요구사항·결정](docs/plan.md)
 - [채택 기준과 검증 방법](docs/project-checklist.md)
 - [현재 작업·검증 결과·다음 단계](task.md)
+- [0단계 빌드·실행·GUI 검증 절차](docs/validation.md)
+
+검증 준비물은 고정 FreeRDP의 이벤트 관측 패치와 실행 도구, Windows 창·트레이 시험 앱입니다. Python 3.10 이상에서 `python3 tools/probe.py --help`로 시작합니다. 자동 테스트는 `cmake -S . -B build/checks -G Ninja` 후 `ctest --test-dir build/checks --output-on-failure`로 실행합니다. 의존성·플랫폼별 빌드 방법과 결과 기록 방법은 위 검증 안내에 있습니다.
 
 최종 구조는 Qt 6/C++ 관리 GUI, 호스트별 FreeRDP/SDL 3 세션 프로세스, 같은 저장소의 Windows 보조 앱입니다. 서버 주소와 인증 도메인을 분리하고, 비밀번호는 선택한 경우에만 OS 키링에 저장합니다. 키링 장애 시 평문 파일로 대체하지 않습니다.
 

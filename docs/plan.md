@@ -83,6 +83,16 @@ GUI는 설정·수명·사용자 조작·상태를 담당하고 GUI 스레드에
 
 ## 운영 기록과 자료
 
+### 0단계 소스 조사 결과 (2026-11-13)
+
+고정 커밋의 `client/SDL/SDL3/sdl_rail.cpp`에서 창 생성/변경/삭제, 모니터링 데스크톱 콜백과 서버 시작 명령 처리를 확인했다. 같은 파일은 RAIL을 experimental로 경고한다. `registerUpdateCallbacks`에는 `NotifyIconCreate/Update/Delete` 등록이 없다. 따라서 현 SDL3 클라이언트를 호출하는 것만으로 R4의 트레이 UI·조작이 완성되지 않는다. [고정 소스](https://github.com/FreeRDP/FreeRDP/blob/65bcca1913a28cbdd7eb913599f692bd2b707991/client/SDL/SDL3/sdl_rail.cpp)
+
+SDL3 빌드에는 Wayland 네이티브 move/resize 보조 경로가 있으나 의존성이 없으면 stub으로 빌드될 수 있다. 검증 빌드는 Linux에서 `WITH_SDL_WAYLAND_NATIVE`가 실제 컴파일 옵션에 있는지 확인한다. 이는 GNOME 동작 검증을 대체하지 않는다. [빌드 소스](https://github.com/FreeRDP/FreeRDP/blob/65bcca1913a28cbdd7eb913599f692bd2b707991/client/SDL/SDL3/CMakeLists.txt)
+
+현재 수정은 수신 이벤트의 종류/숫자 ID만 관측하는 단일 파일 패치이다. 기존 FreeRDP 인증·RDP 통신·영상·창 처리를 유지하고 실행 도구에서 별도 프로세스로 호출한다. 제품의 IPC·트레이·호스트 표시 수정 범위는 실환경 증거 후 결정한다. 모니터링/비모니터링 데스크톱 콜백이 있다는 사실만으로 사용자 모드 전환과 작업 보존을 지원한다고 결론 내리지 않는다.
+
+Windows 시험 앱은 [Shell_NotifyIconW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw)의 생성/수정/삭제·버전 4 콜백과 [ProcessIdToSessionId](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-processidtosessionid)를 사용한다. DPI는 [Microsoft 권고](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setprocessdpiawarenesscontext)에 따라 manifest에서 PerMonitorV2로 선언한다. 실제 Windows GUI 동작은 아직 미검증이다.
+
 기준은 `docs/project-checklist.md`, 실제 작업·검증 결과는 `task.md`에 기록한다. 기준 체크는 채택 표시이며 테스트 통과 표시가 아니다. 검증한 작업 단위와 기록을 자동 로컬 커밋하고 관계없는 변경은 제외한다. 푸시·원격 커밋·게시·유료 자원 사용은 별도 권한이 있을 때만 한다.
 
 이번 세션에서 다시 읽은 필수 지침: [개발 시작 지침 v1 revision 8](https://kickoff.jujin.dev/ai/startup/latest.md), [AI 행동 지침](https://kickoff.jujin.dev/ai/instructions.md). 카탈로그는 읽지 않았다. PC 공통 `/Users/jujin/.codex/RTK.md`에 따라 셸 명령은 `rtk`를 통해 실행한다.
