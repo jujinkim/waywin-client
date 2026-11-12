@@ -1,0 +1,12 @@
+.cache/
+build/
+out/
+__pycache__/
+*.pyc
+.DS_Store
+*.user
+*.rdp
+.env
+.env.*
+!.env.example
+
