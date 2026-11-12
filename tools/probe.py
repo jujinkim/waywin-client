@@ -42,7 +42,18 @@ CASES = {
     "P06": "Disconnect/recovery without duplicate launch or logoff",
     "P07": "Two sessions: stopping/killing one leaves the other responsive",
     "P08": "Mixed/duplicate desktop and selected windows (optional)",
+    "P09": "Actual Windows Start, IME settings and Quick Settings mirrored and interactive",
+    "P10": "Host/client multi-monitor matrix, mixed DPI and topology recovery",
 }
+MONITOR_CASES = {
+    "M01": "One host physical display / one client display",
+    "M02": "Multiple host physical displays / one client display",
+    "M03": "One host physical display / multiple client displays",
+    "M04": "Multiple host physical displays / multiple client displays",
+    "M05": "Mixed 100/150/200% DPI, negative coordinates, portrait and selected primary",
+    "M06": "Unplug/replug, primary change and reconnect without lost windows",
+}
+SHELL_CASES = {"start": "Start menu", "ime": "IME settings and input UI", "quick": "Quick Settings"}
 
 
 class ProbeError(Exception):
@@ -216,12 +227,45 @@ def text_option(value: str, name: str) -> str:
     return value
 
 
+def display_config(mode: str, display_mode: str = "auto", monitors: str | None = None,
+                   size: str | None = None, dynamic: bool = False) -> dict:
+    if mode not in ("desktop", "rail") or display_mode not in ("auto", "window", "multimon"):
+        raise ProbeError("Invalid display mode")
+    resolved = ("multimon" if mode == "rail" else "window") if display_mode == "auto" else display_mode
+    if mode == "rail" and resolved == "window":
+        raise ProbeError("RAIL uses monitor layout; select one SDL monitor ID for a single-display test")
+    ids = []
+    if monitors is not None:
+        if resolved != "multimon" or not re.fullmatch(r"[0-9]{1,10}(?:,[0-9]{1,10}){0,15}", monitors):
+            raise ProbeError("Monitor selection requires multimon and 1..16 SDL display IDs")
+        ids = [int(value) for value in monitors.split(",")]
+        if len(set(ids)) != len(ids) or any(not 1 <= value <= 0xFFFFFFFF for value in ids):
+            raise ProbeError("SDL display IDs must be unique positive 32-bit values")
+    if resolved == "multimon" and size is not None:
+        raise ProbeError("A fixed window size cannot be combined with monitor layout")
+    if resolved == "window":
+        size = size or "1280x720"
+        if not re.fullmatch(r"[0-9]{3,4}x[0-9]{3,4}", size) or not all(
+                200 <= int(value) <= 8192 for value in size.split("x")):
+            raise ProbeError("Window size must be WIDTHxHEIGHT, each dimension 200..8192")
+    return {"mode": resolved, "monitor_ids": ids, "window_size": size, "dynamic_resolution": dynamic}
+
+
 def rdp_args(binary: Path, server: str, user: str, domain: str, label: str,
-             mode: str, app: str | None) -> list[str]:
+             mode: str, app: str | None, *, display_mode: str = "auto", monitors: str | None = None,
+             size: str | None = None, dynamic: bool = False) -> list[str]:
+    display = display_config(mode, display_mode, monitors, size, dynamic)
     args = [str(binary), f"/v:{endpoint(server)}", f"/u:{text_option(user, 'user')}",
-            f"/t:[{text_option(label, 'label')}] WayWin probe", "/size:1280x720",
+            f"/t:[{text_option(label, 'label')}] WayWin probe",
             "-clipboard", "/audio-mode:2", "-auto-reconnect", "/timeout:9000",
             "/log-level:ERROR"]
+    if display["mode"] == "multimon":
+        args.append("/multimon")
+        if display["monitor_ids"]:
+            args.append("/monitors:" + ",".join(str(value) for value in display["monitor_ids"]))
+    else:
+        args.extend(["-multimon", "/size:" + display["window_size"]])
+    args.append("+dynamic-resolution" if dynamic else "-dynamic-resolution")
     if domain:
         args.append(f"/d:{text_option(domain, 'domain')}")
     if mode == "rail":
@@ -282,6 +326,28 @@ def verified_binary(manifest_path: Path) -> tuple[Path, dict]:
     return binary, manifest
 
 
+def session_environment() -> dict:
+    env = os.environ.copy()
+    # Raw upstream file logging must not be inherited by a probe or inventory command.
+    for key in list(env):
+        if key.startswith("WLOG_") or key.startswith("SDL_"):
+            del env[key]
+    env.update(SDL_VIDEO_DRIVER="wayland", WAYWIN_PROBE_EVENTS="1", WLOG_LEVEL="ERROR",
+               WLOG_APPENDER="CONSOLE")
+    return env
+
+
+def list_monitors(manifest_path: Path) -> int:
+    if not doctor()["target_ready"]:
+        raise ProbeError("Monitor inventory requires the Ubuntu GNOME Wayland target")
+    binary, provenance = verified_binary(manifest_path)
+    if provenance["system"] != "Linux" or not provenance["native_wayland_helpers"]:
+        raise ProbeError("Monitor inventory requires a Linux native Wayland build")
+    # No server or credentials; the SDL client exits after enumerating local displays.
+    return subprocess.run([str(binary), "/list:monitor"], env=session_environment(),
+                          stdin=subprocess.DEVNULL, timeout=15, check=False).returncode
+
+
 def run(args) -> int:
     environment = doctor()
     if not environment["target_ready"]:
@@ -289,22 +355,20 @@ def run(args) -> int:
     binary, provenance = verified_binary(args.manifest)
     if provenance["system"] != "Linux" or not provenance["native_wayland_helpers"]:
         raise ProbeError("This binary was not built with Linux native Wayland helpers")
-    argv = rdp_args(binary, args.server, args.user, args.domain, args.label, args.mode, args.app)
+    display = display_config(args.mode, args.display_mode, args.monitors, args.size, args.dynamic_resolution)
+    argv = rdp_args(binary, args.server, args.user, args.domain, args.label, args.mode, args.app,
+                    display_mode=args.display_mode, monitors=args.monitors, size=args.size,
+                    dynamic=args.dynamic_resolution)
     run_id = str(uuid.uuid4())
     directory = args.output / run_id
     directory.mkdir(parents=True, mode=0o700)
     private_json(directory / "run.json", {
         "schema": 1, "run_id": run_id, "host_label": args.label, "mode": args.mode,
+        "requested_display": display,
         "environment": environment, "build": provenance, "pass": False,
         "note": "Observer events establish reception only; complete manual cases separately.",
     })
-    env = os.environ.copy()
-    # Ignore inherited logging configuration; do not create upstream raw log files.
-    for key in list(env):
-        if key.startswith("WLOG_") or key.startswith("SDL_"):
-            del env[key]
-    env.update(SDL_VIDEO_DRIVER="wayland", WAYWIN_PROBE_EVENTS="1", WLOG_LEVEL="ERROR",
-               WLOG_APPENDER="CONSOLE")
+    env = session_environment()
     print(f"Run {run_id}\nEvidence: {directory}\nEnter the password only in the SDL dialog. "
           "Cancel there or press Ctrl-C here to disconnect.", flush=True)
     count = 0
@@ -347,12 +411,25 @@ def run(args) -> int:
 
 
 def report_template() -> dict:
-    return {"schema": 1, "environment": {"ubuntu": "", "gnome": "", "sdl_driver": "",
+    return {"schema": 2, "environment": {"ubuntu": "", "gnome": "", "sdl_driver": "",
             "windows_edition_build": "", "rdp_policy": "", "freerdp_commit": "",
             "patch_sha256": ""}, "tester": "", "date": "", "applications": [],
             "cases": {case: {"description": desc, "status": "not-run", "evidence": [],
                               "notes": "", "required": case != "P08"}
-                      for case, desc in CASES.items()}}
+                      for case, desc in CASES.items()},
+            "shell_surfaces": {key: {"description": desc, "status": "not-run", "evidence": [],
+                                     "notes": "", "remote_ui_visible": False, "interactive": False,
+                                     "same_session": False} for key, desc in SHELL_CASES.items()},
+            "monitor_matrix": {key: {"description": desc, "status": "not-run", "evidence": [],
+                                     "notes": "", "host_physical_layout": "", "client_layout": "",
+                                     "rdp_session_layout": ""} for key, desc in MONITOR_CASES.items()}}
+
+
+def manual_pass(item) -> bool:
+    return (isinstance(item, dict) and item.get("status") == "pass"
+            and isinstance(item.get("evidence"), list) and bool(item["evidence"])
+            and all(isinstance(e, str) and e.strip() for e in item["evidence"])
+            and isinstance(item.get("notes"), str) and bool(item["notes"].strip()))
 
 
 def assess(report: dict) -> list[str]:
@@ -360,7 +437,7 @@ def assess(report: dict) -> list[str]:
     problems = []
     if not isinstance(report, dict):
         return ["Report must be an object"]
-    if report.get("schema") != 1:
+    if report.get("schema") != 2:
         problems.append("Unsupported report schema")
     environment = report.get("environment", {})
     if not isinstance(environment, dict):
@@ -395,11 +472,20 @@ def assess(report: dict) -> list[str]:
         if not isinstance(item, dict):
             problems.append(f"{case}: must be an object")
             continue
-        evidence = item.get("evidence")
-        if (item.get("status") != "pass" or not isinstance(evidence, list) or not evidence
-                or not all(isinstance(e, str) and e.strip() for e in evidence)
-                or not isinstance(item.get("notes"), str) or not item["notes"].strip()):
+        if not manual_pass(item):
             problems.append(f"{case}: needs manual pass, evidence references and observations")
+    surfaces = report.get("shell_surfaces", {})
+    for key in SHELL_CASES:
+        item = surfaces.get(key) if isinstance(surfaces, dict) else None
+        if not manual_pass(item) or not all(item.get(field) is True for field in
+                ("remote_ui_visible", "interactive", "same_session")):
+            problems.append(f"Shell {key}: needs the actual interactive remote UI in the same session")
+    matrix = report.get("monitor_matrix", {})
+    for key in MONITOR_CASES:
+        item = matrix.get(key) if isinstance(matrix, dict) else None
+        if not manual_pass(item) or not all(isinstance(item.get(field), str) and item[field].strip()
+                for field in ("host_physical_layout", "client_layout", "rdp_session_layout")):
+            problems.append(f"{key}: needs observed host, client and RDP session layouts with evidence")
     return problems
 
 
@@ -410,6 +496,8 @@ def main() -> int:
     builder = sub.add_parser("build", help="Build a local SDL3 probe, never install system-wide")
     builder.add_argument("--jobs", type=int, choices=range(1, 65), default=4, metavar="1..64")
     sub.add_parser("doctor", help="Check target environment without a connection")
+    inventory = sub.add_parser("list-monitors", help="List local SDL display IDs without an RDP connection")
+    inventory.add_argument("--manifest", type=Path, default=BUILD / "build-manifest.json")
     runner = sub.add_parser("run", help="Launch one isolated native Wayland RDP probe")
     runner.add_argument("--server", required=True)
     runner.add_argument("--user", required=True)
@@ -417,6 +505,11 @@ def main() -> int:
     runner.add_argument("--label", required=True, help="Non-sensitive host label, e.g. host-a")
     runner.add_argument("--mode", choices=["desktop", "rail"], required=True)
     runner.add_argument("--app")
+    runner.add_argument("--display-mode", choices=["auto", "window", "multimon"], default="auto",
+                        help="auto: desktop window or RAIL monitor layout")
+    runner.add_argument("--monitors", help="Comma-separated SDL IDs from list-monitors; first is primary")
+    runner.add_argument("--size", help="Windowed desktop WIDTHxHEIGHT; default 1280x720")
+    runner.add_argument("--dynamic-resolution", action="store_true", help="Exercise display-control changes")
     runner.add_argument("--manifest", type=Path, default=BUILD / "build-manifest.json")
     runner.add_argument("--output", type=Path, default=ROOT / "out/runs")
     template = sub.add_parser("new-report", help="Create an entirely NOT-RUN manual report")
@@ -435,6 +528,8 @@ def main() -> int:
             return 0 if result["target_ready"] else 2
         elif args.action == "run":
             return run(args)
+        elif args.action == "list-monitors":
+            return list_monitors(args.manifest)
         elif args.action == "new-report":
             private_json(args.path, report_template())
         elif args.action == "assess":
@@ -442,7 +537,7 @@ def main() -> int:
             print(json.dumps({"record_complete": not problems, "problems": problems,
                               "independently_verified": False}, indent=2))
             return 2 if problems else 0
-    except (ProbeError, OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+    except (ProbeError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # Never echo command arguments or source text from input on errors.
         message = str(error) if isinstance(error, ProbeError) else type(error).__name__
         print(f"Probe error: {message}", file=sys.stderr)

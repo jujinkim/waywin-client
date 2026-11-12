@@ -5,6 +5,7 @@
 #include <shellapi.h>
 #include <objbase.h>
 #include <algorithm>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -12,13 +13,9 @@ namespace {
 constexpr wchar_t WindowClass[] = L"WayWinProbeWindow";
 constexpr UINT TrayMessage = WM_APP + 1;
 enum Command : UINT { NewWindow = 100, DelayedWindow, Popup, AddTray, ChangeTray, RemoveTray,
-                       Minimize, Restore, Resize, LaunchNotepad, Quit };
-struct Button { Command command; const wchar_t* label; };
-constexpr Button Buttons[] = {{NewWindow, L"&New window"}, {DelayedWindow, L"New in &15 seconds"},
-    {Popup, L"&Popup dialog"}, {AddTray, L"&Add tray icon"}, {ChangeTray, L"&Change tray icon"},
-    {RemoveTray, L"&Delete tray icon"}, {Minimize, L"&Minimize documents"},
-    {Restore, L"&Restore documents"}, {Resize, L"Resi&ze documents"},
-    {LaunchNotepad, L"Launch &Notepad"}, {Quit, L"E&xit fixture"}};
+                       Minimize, Restore, Resize, LaunchNotepad, Quit,
+                       StartMenu, InputSettings, KoreanImeSettings, QuickSettings };
+constexpr wchar_t FontProperty[] = L"WayWinProbe.Font";
 HINSTANCE instance = nullptr;
 HWND mainWindow = nullptr;
 std::vector<HWND> documents;
@@ -35,12 +32,68 @@ UINT taskbarCreated = 0;
 
 int scale(HWND window, int value) { return MulDiv(value, static_cast<int>(GetDpiForWindow(window)), 96); }
 
+bool updateFont(HWND window) {
+    NONCLIENTMETRICSW metrics{};
+    metrics.cbSize = sizeof(metrics);
+    if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0,
+                                    GetDpiForWindow(window))) return false;
+    const HFONT font = CreateFontIndirectW(&metrics.lfMessageFont);
+    if (!font) return false;
+    const auto previous = GetPropW(window, FontProperty);
+    if (!SetPropW(window, FontProperty, font)) { DeleteObject(font); return false; }
+    EnumChildWindows(window, [](HWND child, LPARAM value) -> BOOL {
+        SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(value), TRUE);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(font));
+    if (previous) DeleteObject(previous);
+    return true;
+}
+
+HMENU createProbeMenu() {
+    const HMENU menu = CreateMenu();
+    if (!menu) return nullptr;
+    // Menus keep every action reachable at high DPI and on short displays.
+    struct Entry { UINT id; const wchar_t* label; };
+    const auto appendGroup = [&](const wchar_t* label, std::initializer_list<Entry> entries) {
+        const HMENU group = CreatePopupMenu();
+        if (!group) return false;
+        for (const auto& entry : entries) {
+            if (!AppendMenuW(group, MF_STRING, entry.id, entry.label)) {
+                DestroyMenu(group);
+                return false;
+            }
+        }
+        if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(group), label)) {
+            DestroyMenu(group);
+            return false;
+        }
+        return true;
+    };
+    if (!appendGroup(L"&Documents", {{NewWindow, L"&New window"}, {DelayedWindow, L"New in &15 seconds"},
+            {Minimize, L"&Minimize documents"}, {Restore, L"&Restore documents"}, {Resize, L"Resi&ze documents"},
+            {Popup, L"&Popup dialog"}, {LaunchNotepad, L"Launch &Notepad"}}) ||
+        !appendGroup(L"&Tray", {{AddTray, L"&Add tray icon"}, {ChangeTray, L"&Change tray icon"},
+            {RemoveTray, L"&Delete tray icon"}}) ||
+        !appendGroup(L"Windows &shell", {{StartMenu, L"&Start menu"}, {InputSettings, L"&Input settings"},
+            {KoreanImeSettings, L"&Korean IME settings"}, {QuickSettings, L"&Quick Settings"}}) ||
+        !AppendMenuW(menu, MF_STRING, Quit, L"E&xit")) {
+        DestroyMenu(menu);
+        return nullptr;
+    }
+    return menu;
+}
+
 void refreshStatus() {
     const auto message = L"Session " + std::to_wstring(sessionId) + L" | PID " +
         std::to_wstring(GetCurrentProcessId()) + L" | alive " +
         std::to_wstring((GetTickCount64() - started) / 1000) + L"s\r\nInstance " + identity +
         L"\r\nTray clicks " + std::to_wstring(trayClicks) + L", menus " +
-        std::to_wstring(trayMenus) + L"\r\n" + lastAction;
+        std::to_wstring(trayMenus) + L" | DPI " + std::to_wstring(GetDpiForWindow(mainWindow)) +
+        L"\r\nSession displays " + std::to_wstring(GetSystemMetrics(SM_CMONITORS)) + L" | bounds " +
+        std::to_wstring(GetSystemMetrics(SM_XVIRTUALSCREEN)) + L"," +
+        std::to_wstring(GetSystemMetrics(SM_YVIRTUALSCREEN)) + L" " +
+        std::to_wstring(GetSystemMetrics(SM_CXVIRTUALSCREEN)) + L"x" +
+        std::to_wstring(GetSystemMetrics(SM_CYVIRTUALSCREEN)) + L"\r\n" + lastAction;
     SetWindowTextW(GetDlgItem(mainWindow, 1), message.c_str());
 }
 
@@ -94,21 +147,50 @@ void layout(HWND window) {
     const int gap = scale(window, 12);
     const bool main = GetWindowLongPtrW(window, GWLP_USERDATA) == 0;
     if (main) {
-        const int buttons = scale(window, 194);
         MoveWindow(GetDlgItem(window, 1), gap, gap, std::max(1, static_cast<int>(rect.right) - 2 * gap),
-                   scale(window, 100), TRUE);
-        const int top = scale(window, 124);
-        MoveWindow(GetDlgItem(window, 2), gap, top, std::max(1, static_cast<int>(rect.right) - buttons - 3 * gap),
+                   scale(window, 160), TRUE);
+        const int top = scale(window, 184);
+        MoveWindow(GetDlgItem(window, 2), gap, top, std::max(1, static_cast<int>(rect.right) - 2 * gap),
                    std::max(1, static_cast<int>(rect.bottom) - top - gap), TRUE);
-        int y = top;
-        for (const auto& button : Buttons) {
-            MoveWindow(GetDlgItem(window, button.command), static_cast<int>(rect.right) - buttons - gap,
-                       y, buttons, scale(window, 30), TRUE);
-            y += scale(window, 36);
-        }
     } else {
         MoveWindow(GetDlgItem(window, 2), gap, gap, std::max(1, static_cast<int>(rect.right) - 2 * gap),
                    std::max(1, static_cast<int>(rect.bottom) - 2 * gap), TRUE);
+    }
+}
+
+void openSettings(const wchar_t* uri) {
+    const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(mainWindow, L"open", uri,
+                                                              nullptr, nullptr, SW_SHOWNORMAL));
+    lastAction = result > 32 ? L"Windows settings requested; verify the actual remote UI and input."
+                            : L"Windows settings request failed or page unavailable.";
+}
+
+void requestQuickSettings() {
+    // A user-invoked shell shortcut in this Windows session. Never a key logger.
+    if (GetForegroundWindow() != mainWindow) {
+        lastAction = L"Focus this fixture before requesting Quick Settings.";
+        return;
+    }
+    for (int key : {VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, static_cast<int>('A')}) {
+        if (GetAsyncKeyState(key) & 0x8000) {
+            lastAction = L"Release modifier keys and A, then select Quick Settings again.";
+            return;
+        }
+    }
+    INPUT input[4]{};
+    for (auto& event : input) event.type = INPUT_KEYBOARD;
+    input[0].ki.wVk = input[3].ki.wVk = VK_LWIN;
+    input[0].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+    input[1].ki.wVk = input[2].ki.wVk = 'A';
+    input[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    input[3].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP;
+    const UINT sent = SendInput(4, input, sizeof(INPUT));
+    if (sent != 4) {
+        // Release only synthetic keys potentially left pressed by a partial insertion.
+        if (sent > 0) SendInput(2, &input[2], sizeof(INPUT));
+        lastAction = L"Quick Settings shortcut failed; record the session/policy limitation.";
+    } else {
+        lastAction = L"Quick Settings shortcut sent; this does not prove the flyout was mirrored.";
     }
 }
 
@@ -156,6 +238,14 @@ void perform(UINT command) {
                                 : L"Notepad launch failed.";
         break;
     }
+    case StartMenu:
+        lastAction = PostMessageW(mainWindow, WM_SYSCOMMAND, SC_TASKLIST, 0)
+            ? L"Start menu requested; verify remote display, search, selection and dismissal."
+            : L"Start menu request failed.";
+        break;
+    case InputSettings: openSettings(L"ms-settings:keyboard-advanced"); break;
+    case KoreanImeSettings: openSettings(L"ms-settings:regionlanguage-korime"); break;
+    case QuickSettings: requestQuickSettings(); break;
     case Quit: SendMessageW(mainWindow, WM_CLOSE, 0, 0); return;
     default: return;
     }
@@ -177,24 +267,25 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_CREATE: {
         if (main) {
             mainWindow = window;
+            const HMENU menu = createProbeMenu();
+            if (!menu) return -1;
+            if (!SetMenu(window, menu)) { DestroyMenu(menu); return -1; }
             CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1,
                             window, reinterpret_cast<HMENU>(1), instance, nullptr);
-            for (const auto& button : Buttons)
-                CreateWindowExW(0, L"BUTTON", button.label, WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                0, 0, 1, 1, window, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(button.command)),
-                                instance, nullptr);
             SetTimer(window, 1, 1000, nullptr);
         }
         CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
             ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL, 0, 0, 1, 1,
             window, reinterpret_cast<HMENU>(2), instance, nullptr);
         SendDlgItemMessageW(window, 2, EM_SETLIMITTEXT, 32768, 0);
+        if (!updateFont(window)) return -1;
         layout(window);
         return 0;
     }
     case WM_SIZE: layout(window); return 0;
     case WM_DPICHANGED: {
         const auto rect = reinterpret_cast<RECT*>(lParam);
+        if (!updateFont(window)) lastAction = L"DPI font update failed.";
         SetWindowPos(window, nullptr, rect->left, rect->top, rect->right - rect->left,
                      rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE);
         layout(window);
@@ -202,9 +293,12 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
     case WM_GETMINMAXINFO: {
         auto info = reinterpret_cast<MINMAXINFO*>(lParam);
-        info->ptMinTrackSize = {scale(window, main ? 700 : 320), scale(window, main ? 610 : 240)};
+        info->ptMinTrackSize = {scale(window, main ? 380 : 320), scale(window, main ? 320 : 240)};
         return 0;
     }
+    case WM_DISPLAYCHANGE:
+        if (main) refreshStatus();
+        return 0;
     case WM_TIMER:
         if (wParam == 2) { KillTimer(window, 2); createDocument(); }
         if (main) refreshStatus();
@@ -252,6 +346,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             documents.erase(std::remove(documents.begin(), documents.end(), window), documents.end());
         }
         return 0;
+    case WM_NCDESTROY:
+        if (const auto font = RemovePropW(window, FontProperty)) DeleteObject(font);
+        break;
     default: break;
     }
     return DefWindowProcW(window, message, wParam, lParam);

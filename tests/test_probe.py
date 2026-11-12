@@ -61,6 +61,52 @@ class EndpointTests(unittest.TestCase):
         self.assertNotIn("SECRET-SENTINEL", result.stdout + result.stderr)
 
 
+class DisplayTests(unittest.TestCase):
+    def argv(self, mode="desktop", **options):
+        return probe.rdp_args(Path("binary"), "pc", "alice", "", "host-a", mode,
+                              "||probe" if mode == "rail" else None, **options)
+
+    def test_desktop_window_and_rail_layout_have_distinct_defaults(self):
+        desktop = self.argv()
+        self.assertIn("/size:1280x720", desktop)
+        self.assertIn("-multimon", desktop)
+        rail = self.argv("rail")
+        self.assertIn("/multimon", rail)
+        self.assertFalse(any(arg.startswith("/size:") for arg in rail))
+
+    def test_selected_primary_order_is_preserved(self):
+        args = self.argv(display_mode="multimon", monitors="3,1")
+        self.assertIn("/monitors:3,1", args)
+        self.assertNotIn("/size:1280x720", args)
+        self.assertIn("/monitors:2", self.argv("rail", monitors="2"))
+
+    def test_invalid_ids_and_contradictory_modes_rejected(self):
+        for monitors in ("0", "1,1", "-1", "4294967296", "1,", "1,2/p:secret", "1, 2", "", ",".join(str(n) for n in range(1, 18))):
+            with self.subTest(monitors=monitors), self.assertRaises(probe.ProbeError):
+                self.argv(display_mode="multimon", monitors=monitors)
+        for mode, options in (("rail", {"display_mode": "window"}), ("desktop", {"monitors": "1"}),
+                              ("desktop", {"display_mode": "multimon", "size": "1280x720"})):
+            with self.subTest(mode=mode, options=options), self.assertRaises(probe.ProbeError):
+                self.argv(mode, **options)
+
+    def test_dynamic_layout_is_explicit(self):
+        self.assertIn("-dynamic-resolution", self.argv("rail"))
+        self.assertIn("+dynamic-resolution", self.argv("rail", dynamic=True))
+        self.assertIn("/size:1920x1080", self.argv(size="1920x1080"))
+        for size in ("100x100", "8193x800", "1920,1080", "1920x1080/p:secret"):
+            with self.subTest(size=size), self.assertRaises(probe.ProbeError): self.argv(size=size)
+
+    def test_monitor_inventory_never_connects(self):
+        with patch.object(probe, "doctor", return_value={"target_ready": True}), \
+             patch.object(probe, "verified_binary", return_value=(Path("/test/binary"),
+                          {"system": "Linux", "native_wayland_helpers": True})), \
+             patch.object(probe.subprocess, "run") as launch:
+            launch.return_value.returncode = 0
+            self.assertEqual(probe.list_monitors(Path("manifest")), 0)
+            self.assertEqual(launch.call_args.args[0], ["/test/binary", "/list:monitor"])
+            self.assertEqual(launch.call_args.kwargs["env"]["SDL_VIDEO_DRIVER"], "wayland")
+
+
 class EventTests(unittest.TestCase):
     def test_receives_numeric_metadata_only(self):
         line = b"WAYWIN_PROBE_V1 type=notify-update window=42 icon=3 flags=4294967295\n"
@@ -122,6 +168,13 @@ class GateTests(unittest.TestCase):
             "patch_sha256": probe.sha256(probe.PATCH)}
         for key, item in report["cases"].items():
             if key != "P08": item.update(status="pass", evidence=["synthetic-reference"], notes="Synthetic test only")
+        for item in report["shell_surfaces"].values():
+            item.update(status="pass", evidence=["synthetic-reference"], notes="Synthetic test only",
+                        remote_ui_visible=True, interactive=True, same_session=True)
+        for item in report["monitor_matrix"].values():
+            item.update(status="pass", evidence=["synthetic-reference"], notes="Synthetic test only",
+                        host_physical_layout="synthetic host", client_layout="synthetic client",
+                        rdp_session_layout="synthetic session")
         return report
 
     def test_template_never_passes(self):
@@ -162,6 +215,33 @@ class GateTests(unittest.TestCase):
         report["applications"] = ["same"] * 5
         self.assertTrue(probe.assess(report))
 
+    def test_shell_launch_success_does_not_count_as_mirroring(self):
+        for surface in probe.SHELL_CASES:
+            for field in ("remote_ui_visible", "interactive", "same_session"):
+                report = self.complete()
+                report["shell_surfaces"][surface][field] = False
+                self.assertTrue(probe.assess(report))
+        report = self.complete()
+        report["shell_surfaces"] = []
+        self.assertTrue(probe.assess(report))
+
+    def test_each_monitor_layout_and_scenario_is_required(self):
+        for case in probe.MONITOR_CASES:
+            for field in ("host_physical_layout", "client_layout", "rdp_session_layout"):
+                report = self.complete()
+                report["monitor_matrix"][case][field] = ""
+                self.assertTrue(probe.assess(report))
+            report = self.complete()
+            report["monitor_matrix"][case]["status"] = "not-run"
+            self.assertTrue(probe.assess(report))
+
+    def test_legacy_report_cannot_skip_new_requirements(self):
+        report = self.complete()
+        report["schema"] = 1
+        del report["shell_surfaces"]
+        del report["monitor_matrix"]
+        self.assertTrue(probe.assess(report))
+
 
 @unittest.skipUnless(os.name == "posix", "POSIX process isolation test")
 class IsolationTests(unittest.TestCase):
@@ -200,6 +280,32 @@ class ProvenanceTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "POSIX probe launcher")
 class LaunchTests(unittest.TestCase):
+    def test_wrong_driver_aborts_and_reaps_real_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "wrong-driver"
+            executable.write_text(f"#!{sys.executable}\nimport sys, time\n"
+                                  "print('WAYWIN_PROBE_V1 driver=x11', file=sys.stderr, flush=True)\n"
+                                  "time.sleep(60)\n")
+            executable.chmod(0o700)
+            args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
+                             label="host-a", mode="rail", app="||probe", output=root / "runs",
+                             display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
+            children = []
+            original_popen = subprocess.Popen
+            def spawn(*argv, **kwargs):
+                child = original_popen(*argv, **kwargs)
+                children.append(child)
+                return child
+            with patch.object(probe, "doctor", return_value={"target_ready": True}), \
+                 patch.object(probe, "verified_binary", return_value=(executable,
+                         {"system": "Linux", "native_wayland_helpers": True})), \
+                 patch.object(probe.subprocess, "Popen", side_effect=spawn), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                with self.assertRaises(probe.ProbeError): probe.run(args)
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+
     def test_end_to_end_evidence_discards_raw_logs_and_separates_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -215,7 +321,8 @@ class LaunchTests(unittest.TestCase):
             executable.chmod(0o700)
             provenance = {"system": "Linux", "native_wayland_helpers": True}
             args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
-                             label="host-a", mode="rail", app="||probe", output=root / "runs")
+                             label="host-a", mode="rail", app="||probe", output=root / "runs",
+                             display_mode="auto", monitors="2,1", size=None, dynamic_resolution=True)
             with patch.object(probe, "doctor", return_value={"target_ready": True}), \
                  patch.object(probe, "verified_binary", return_value=(executable, provenance)), \
                  patch.dict(os.environ, {"WLOG_APPENDER": "FILE", "WLOG_FILEAPPENDER_OUTPUT_FILE_PATH": "secret.log"}), \
@@ -231,7 +338,10 @@ class LaunchTests(unittest.TestCase):
                 self.assertEqual([item["sequence"] for item in data], [1, 2])
                 ids.append(data[0]["run_id"])
                 self.assertEqual(data[0]["run_id"], data[1]["run_id"])
-                self.assertFalse(json.loads((run / "run.json").read_text())["pass"])
+                run_record = json.loads((run / "run.json").read_text())
+                self.assertFalse(run_record["pass"])
+                self.assertEqual(run_record["requested_display"], {"mode": "multimon", "monitor_ids": [2, 1],
+                    "window_size": None, "dynamic_resolution": True})
                 self.assertNotIn("SECRET-SENTINEL", "".join(p.read_text() for p in run.iterdir()))
             self.assertNotEqual(*ids)
 

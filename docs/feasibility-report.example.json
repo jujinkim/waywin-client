@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "environment": {
     "ubuntu": "",
     "gnome": "",
@@ -68,6 +68,105 @@
       "evidence": [],
       "notes": "",
       "required": false
+    },
+    "P09": {
+      "description": "Actual Windows Start, IME settings and Quick Settings mirrored and interactive",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "required": true
+    },
+    "P10": {
+      "description": "Host/client multi-monitor matrix, mixed DPI and topology recovery",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "required": true
+    }
+  },
+  "shell_surfaces": {
+    "start": {
+      "description": "Start menu",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "remote_ui_visible": false,
+      "interactive": false,
+      "same_session": false
+    },
+    "ime": {
+      "description": "IME settings and input UI",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "remote_ui_visible": false,
+      "interactive": false,
+      "same_session": false
+    },
+    "quick": {
+      "description": "Quick Settings",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "remote_ui_visible": false,
+      "interactive": false,
+      "same_session": false
+    }
+  },
+  "monitor_matrix": {
+    "M01": {
+      "description": "One host physical display / one client display",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "host_physical_layout": "",
+      "client_layout": "",
+      "rdp_session_layout": ""
+    },
+    "M02": {
+      "description": "Multiple host physical displays / one client display",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "host_physical_layout": "",
+      "client_layout": "",
+      "rdp_session_layout": ""
+    },
+    "M03": {
+      "description": "One host physical display / multiple client displays",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "host_physical_layout": "",
+      "client_layout": "",
+      "rdp_session_layout": ""
+    },
+    "M04": {
+      "description": "Multiple host physical displays / multiple client displays",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "host_physical_layout": "",
+      "client_layout": "",
+      "rdp_session_layout": ""
+    },
+    "M05": {
+      "description": "Mixed 100/150/200% DPI, negative coordinates, portrait and selected primary",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "host_physical_layout": "",
+      "client_layout": "",
+      "rdp_session_layout": ""
+    },
+    "M06": {
+      "description": "Unplug/replug, primary change and reconnect without lost windows",
+      "status": "not-run",
+      "evidence": [],
+      "notes": "",
+      "host_physical_layout": "",
+      "client_layout": "",
+      "rdp_session_layout": ""
     }
   }
 }
