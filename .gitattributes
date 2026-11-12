@@ -1,0 +1,3 @@
+# Unified patches contain mandatory context prefixes before upstream tabs/blanks.
+# Check their applied source for whitespace; do not normalize the patch bytes.
+patches/*.patch -whitespace
