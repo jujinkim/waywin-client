@@ -480,11 +480,12 @@ def parse_event(line: bytes) -> dict | None:
     return {"type": "driver", "driver": name if name in DRIVERS else "unknown"}
 
 
-def pipe_chunks(stream, released: threading.Event):
+def pipe_chunks(stream, released: threading.Event, lost: threading.Event | None = None):
     # Read until EOF, or until the pipe is idle after `released` is set: a process that outlived
-    # the session in another process group can hold the write end open indefinitely.
+    # the session in another process group can hold the write end open indefinitely. A lost
+    # guard stops the reading at once.
     descriptor = stream.fileno()
-    while True:
+    while not (lost and lost.is_set()):
         if select.select([descriptor], [], [], 0.1)[0]:
             chunk = os.read(descriptor, 65536)
             if not chunk:
@@ -494,8 +495,8 @@ def pipe_chunks(stream, released: threading.Event):
             return
 
 
-def events(stream, released: threading.Event | None = None):
-    chunks = pipe_chunks(stream, released) if released else iter(lambda: stream.read(65536), b"")
+def events(stream, released: threading.Event | None = None, lost: threading.Event | None = None):
+    chunks = pipe_chunks(stream, released, lost) if released else iter(lambda: stream.read(65536), b"")
     pending, oversize = b"", False
     for chunk in chunks:
         pending += chunk
@@ -539,64 +540,225 @@ def stop_child(child: subprocess.Popen, timeout: float = 3.0) -> None:
         pass
 
 
-# Runs in its own session so that signals to the tool's terminal or process group do not reach it.
-# It ends the recorded session group when the tool's end of the pipe closes without "done", which
-# happens when the tool itself is killed (SIGKILL) and cannot clean up.
-GUARD_CODE = r"""
-import os, signal, sys, time
-for number in (signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGTSTP):
-    signal.signal(number, signal.SIG_IGN)
-os.write(1, b"r")  # Ready: the tool starts no session before this arrives.
-os.close(1)
-data = b""
-while True:
-    chunk = os.read(0, 64)
-    if not chunk:
-        break
-    data += chunk
-    if b"done\n" in data or len(data) > 64:
-        sys.exit(0)
-try:
-    group = int(data.split(b"\n")[0])
-except ValueError:
-    sys.exit(0)
-if group <= 1:
-    sys.exit(0)
-def signal_group(number):
+# Every process of a run carries this variable, so it is still found after it leaves the session's
+# process group and session. Only Linux lets the tool read another process's environment.
+RUN_MARKER = "WAYWIN_PROBE_RUN"
+
+# The guard's code. It is started as `python -I -c GUARD_CODE`, so its command line names neither
+# this file nor the project: a pattern used to kill a stuck tool (pkill -f probe.py) does not also
+# kill the guard. The same text is executed below so that the tool and its tests share it.
+GUARD_CODE = r'''
+import contextlib, os, signal, subprocess, sys, time
+from pathlib import Path
+
+
+def linux_processes(root):
+    for entry in os.scandir(root):
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = Path(entry.path, "stat").read_bytes()
+        except OSError:
+            continue  # Already gone.
+        try:
+            environ = Path(entry.path, "environ").read_bytes().split(b"\0")
+        except OSError:
+            environ = []  # Another user's or a non-dumpable process: its environment is hidden.
+        # The command name in parentheses may itself contain spaces and parentheses.
+        fields = stat[stat.rfind(b")") + 2:].split()
+        try:
+            yield int(entry.name), fields[0].decode("ascii", "replace"), int(fields[2]), int(fields[3]), environ
+        except (IndexError, ValueError):
+            continue
+
+
+def ps_processes():
+    # Neither the environment nor the session ID of another process is in ps output here.
+    result = subprocess.run(["/bin/ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, check=False)
+    for line in result.stdout.decode("ascii", "replace").splitlines():
+        fields = line.split()
+        try:
+            pid, group = int(fields[0]), int(fields[1])
+            session = os.getsid(pid)
+        except (IndexError, ValueError, OSError):
+            continue
+        yield pid, fields[2] if len(fields) > 2 else "", group, session, []
+
+
+def session_processes(group, marker, proc_root=None):
+    # A group or session ID is not reused while any process still has it, so every process found
+    # by those IDs belongs to the run; the marker is unique to the run.
+    wanted = f"WAYWIN_PROBE_RUN={marker}".encode()
+    if proc_root is None and sys.platform.startswith("linux"):
+        proc_root = Path("/proc")
+    listing = linux_processes(proc_root) if proc_root is not None else ps_processes()
+    found = set()
+    for pid, state, pgid, session, environ in listing:
+        if pid == os.getpid() or state.startswith("Z"):
+            continue  # A zombie has already ended; only its parent can remove it.
+        if (group and group in (pgid, session)) or wanted in environ:
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError):
+                continue
+            found.add(pid)
+    return found
+
+
+def end_session(group, marker, grace, proc_root=None, interval=0.05):
+    # SIGTERM first so the session can disconnect cleanly, then SIGKILL for whatever remains,
+    # including processes started while it ended. Stops after two consecutive empty scans.
+    def send(pids, number):
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, number)
+    asked = set()
+    deadline = time.monotonic() + grace
+    while True:
+        found = session_processes(group, marker, proc_root)
+        send(found - asked, signal.SIGTERM)
+        asked |= found
+        if not found or time.monotonic() >= deadline:
+            break
+        time.sleep(interval)
+    quiet, limit = 0, time.monotonic() + 5.0
+    while quiet < 2 and time.monotonic() < limit:
+        found = session_processes(group, marker, proc_root)
+        send(found, signal.SIGKILL)
+        quiet = 0 if found else quiet + 1
+        time.sleep(interval)
+
+
+class GuardStopped(Exception):
+    pass
+
+
+def guard_main(argv):
+    # Runs in its own session, so signals to the tool's terminal or process group do not reach it.
+    # Whenever its stdin closes (the tool released it, or the tool was killed) or it receives
+    # SIGTERM, it ends what is left of the run.
+    grace, marker, gate = float(argv[0]), argv[1], int(argv[2])
+    for number in (signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGTSTP):
+        signal.signal(number, signal.SIG_IGN)
+    reading = True
+    def stopped(number, frame):
+        nonlocal reading
+        if reading:  # Only the wait for the tool is interrupted, never the cleanup below.
+            reading = False
+            raise GuardStopped
+    signal.signal(signal.SIGTERM, stopped)
+    group = None
     try:
-        os.killpg(group, number)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
-if signal_group(signal.SIGTERM):
-    deadline = time.monotonic() + GRACE
-    while time.monotonic() < deadline and signal_group(0):
-        time.sleep(0.05)
-    signal_group(signal.SIGKILL)
+        os.write(1, b"r")  # Ready. Stdout stays open: its EOF tells the tool that the guard is gone.
+        data = b""
+        while len(data) <= 64:
+            chunk = os.read(0, 64)
+            if not chunk:
+                break
+            data += chunk
+            if group is None and b"\n" in data:
+                try:
+                    number = int(data.split(b"\n")[0])
+                except ValueError:
+                    break
+                if number <= 1:
+                    break
+                group = number
+                if gate >= 0:
+                    # The session waits behind this gate, so it never runs before it is registered.
+                    # Forgotten before the close, so a signal in between cannot close it twice.
+                    opened, gate = gate, -1
+                    with contextlib.suppress(OSError):
+                        os.write(opened, b"g")
+                    os.close(opened)
+        reading = False  # Inside the try: a SIGTERM up to here is still caught.
+    except GuardStopped:
+        pass
+    if gate >= 0:
+        with contextlib.suppress(OSError):
+            os.close(gate)  # A session that was never registered gets EOF and does not start.
+    end_session(group, marker, grace)
+    return 0
+'''
+exec(GUARD_CODE)
+
+
+def guard_command(marker: str, grace: float, gate: int | None) -> list[str]:
+    return [sys.executable, "-I", "-c", GUARD_CODE + "\nsys.exit(guard_main(sys.argv[1:]))\n",
+            repr(float(grace)), marker, str(-1 if gate is None else gate)]
+
+
+# The session's first program. It runs with the tool's environment, because some interpreters only
+# start with their loader path set, and reads the session's environment from a pipe. It waits until
+# the guard has registered it, then becomes the session with the same process ID and exactly that
+# environment. If the tool or guard is killed first, it ends without starting anything.
+GATE_CODE = r"""
+import json, os, signal, sys
+gate, source = int(sys.argv[1]), int(sys.argv[2])
+chunks = []
+try:
+    while True:
+        chunk = os.read(source, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(source)
+    environment = json.loads(b"".join(chunks))
+    ready = os.read(gate, 1)
+except (OSError, ValueError):
+    os._exit(125)
+if ready != b"g" or not isinstance(environment, dict):
+    os._exit(125)
+os.close(gate)
+# Python ignores these at startup; a directly started program would get the defaults.
+for number in (signal.SIGPIPE, signal.SIGXFSZ):
+    signal.signal(number, signal.SIG_DFL)
+try:
+    os.execve(sys.argv[3], sys.argv[3:], environment)
+except OSError:
+    os._exit(127)
 """
 
 
-def start_guard(grace: float = 3.0, timeout: float = 10.0) -> subprocess.Popen:
+def start_gated(argv: list[str], env: dict, gate: int, **options) -> subprocess.Popen:
+    # The environment goes through a pipe, never the command line, which other users can read.
+    source, sink = os.pipe()
+    try:
+        child = subprocess.Popen([sys.executable, "-I", "-c", GATE_CODE, str(gate), str(source), *argv],
+                                 pass_fds=(gate, source), **options)
+    except BaseException:
+        os.close(sink)
+        raise
+    finally:
+        os.close(source)
+    def send():
+        with contextlib.suppress(OSError), os.fdopen(sink, "wb") as stream:
+            stream.write(json.dumps(env).encode())
+    # A thread, so an environment larger than the pipe buffer cannot block the tool.
+    threading.Thread(target=send, daemon=True).start()
+    return child
+
+
+def start_guard(marker: str, grace: float = 3.0, timeout: float = 10.0, gate: int | None = None) -> subprocess.Popen:
     # The guard is this same interpreter, so it gets the tool's own environment: some builds only
     # start with their loader path set. -I keeps PYTHON* variables and the user site out.
     try:
-        guard = subprocess.Popen([sys.executable, "-I", "-c", f"GRACE = {float(grace)!r}\n" + GUARD_CODE],
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                 start_new_session=True)
+        guard = subprocess.Popen(guard_command(marker, grace, gate), stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True,
+                                 pass_fds=() if gate is None else (gate,))
     except OSError:
         raise ProbeError("Could not start the session guard") from None
+    guard.grace = grace
     # A guard that cannot start would otherwise go unnoticed until the tool is killed.
     ready = b""
-    try:
-        if select.select([guard.stdout], [], [], timeout)[0]:
-            ready = os.read(guard.stdout.fileno(), 1)
-    finally:
-        guard.stdout.close()
+    if select.select([guard.stdout], [], [], timeout)[0]:
+        ready = os.read(guard.stdout.fileno(), 1)
     if ready != b"r":
         guard.kill()
         guard.wait()
-        with contextlib.suppress(OSError):
-            guard.stdin.close()
+        for stream in (guard.stdin, guard.stdout):
+            with contextlib.suppress(OSError):
+                stream.close()
         raise ProbeError("The session guard did not start; no session was started")
     return guard
 
@@ -610,17 +772,40 @@ def guard_message(guard: subprocess.Popen, message: bytes) -> bool:
         return False
 
 
-def release_guard(guard: subprocess.Popen) -> None:
-    # Only once the session group is gone: "done" tells the guard that nothing is left to end.
-    guard_message(guard, b"done\n")
+def watch_guard(guard: subprocess.Popen, finished: threading.Event, lost: threading.Event) -> None:
+    # The guard keeps its stdout open for its whole life: EOF before the run finished means it was
+    # killed, and the session would no longer be ended if this tool were killed too.
+    descriptor = guard.stdout.fileno()
+    while not finished.is_set():
+        if select.select([descriptor], [], [], 0.1)[0]:
+            if not finished.is_set():
+                lost.set()
+            return
+
+
+def release_guard(guard: subprocess.Popen, marker: str, group: int | None) -> None:
+    # Closing its stdin makes the guard end anything of the run that is left, such as processes
+    # that left the session's group. A guard that was killed is replaced for this last step.
+    if guard.poll() is not None:
+        for stream in (guard.stdin, guard.stdout):
+            with contextlib.suppress(OSError):
+                stream.close()
+        try:
+            guard = start_guard(marker, grace=guard.grace)
+        except ProbeError:
+            return
+        if group:
+            guard_message(guard, f"{group}\n".encode("ascii"))
     with contextlib.suppress(OSError, ValueError):
         guard.stdin.close()
     try:
-        guard.wait(timeout=2.0)
+        guard.wait(timeout=guard.grace + 10.0)
     except subprocess.TimeoutExpired:
         guard.kill()
         with contextlib.suppress(subprocess.TimeoutExpired):
             guard.wait(timeout=2.0)
+    with contextlib.suppress(OSError):
+        guard.stdout.close()
 
 
 def reap_group_after_exit(child: subprocess.Popen, released: threading.Event, finished: threading.Event) -> None:
@@ -719,6 +904,7 @@ def run(args) -> int:
         "note": "Observer events establish reception only; complete manual cases separately.",
     })
     env = session_environment()
+    env[RUN_MARKER] = run_id
     print(f"Run {run_id}\nEvidence: {directory}\nEnter the password only in the SDL dialog. "
           "Cancel there or press Ctrl-C here to disconnect.", flush=True)
     count = 0
@@ -740,23 +926,35 @@ def run(args) -> int:
     if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
         handled.append(signal.SIGHUP)
     previous = {number: signal.signal(number, interrupted) for number in handled}
-    released, finished = threading.Event(), threading.Event()
+    released, finished, lost = threading.Event(), threading.Event(), threading.Event()
     guard = None
+    watcher = None
     try:
         fd = os.open(directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as output:
-            guard = start_guard()
-            child = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                     start_new_session=True)
-            # The child leads its own process group. Until this write the guard knows nothing to
-            # end, so a SIGKILL in the instant between fork and here still leaves the session.
+            # Only the guard holds the gate's write end and only the session holds its read end.
+            gate = list(os.pipe())
+            try:
+                guard = start_guard(run_id, gate=gate[1])
+                os.close(gate.pop())
+                child = start_gated(argv, env, gate[0], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE, start_new_session=True)
+            finally:
+                for descriptor in gate:
+                    os.close(descriptor)
+            # The child leads its own process group and waits at the gate until the guard has
+            # this ID. If this tool is killed before the write, the gate closes and it never starts.
             if not guard_message(guard, f"{child.pid}\n".encode("ascii")) or guard.poll() is not None:
                 raise ProbeError("The session guard stopped; the session was not left running")
             print(f"Session process: {child.pid}", flush=True)
+            watcher = threading.Thread(target=watch_guard, args=(guard, finished, lost), daemon=True)
+            watcher.start()
             threading.Thread(target=reap_group_after_exit, args=(child, released, finished),
                              daemon=True).start()
-            for event in events(child.stderr, released):
+            guard_lost = ProbeError("The session guard was stopped; the session was ended")
+            for event in events(child.stderr, released, lost):
+                if lost.is_set():
+                    raise guard_lost
                 if event["type"] == "driver":
                     driver = event["driver"]
                 # Bounded evidence storage; continue draining after the cap.
@@ -768,6 +966,8 @@ def run(args) -> int:
                 count += 1
                 if driver not in (None, "wayland"):
                     raise ProbeError("SDL did not select the native Wayland driver")
+            if lost.is_set():
+                raise guard_lost
             exit_code = child.wait()
             ended = "session-exit"
     except KeyboardInterrupt:
@@ -788,8 +988,10 @@ def run(args) -> int:
                         if child.stderr:
                             child.stderr.close()
                     if guard:
-                        release_guard(guard)
+                        release_guard(guard, run_id, child.pid if child else None)
                         guard = None
+                        if watcher:
+                            watcher.join()
                     private_json(directory / "exit.json", {
                         "ended": ended, "exit_code": exit_code, "sdl_driver_observed": driver,
                         "events_seen": count, "events_truncated": count > EVENT_LIMIT,

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import signal
 import socket
@@ -31,6 +32,15 @@ def alive(pid):
         return True
     except ProcessLookupError:
         return False
+
+
+def is_guard(command):
+    return len(command) > 3 and command[3].startswith(probe.GUARD_CODE)
+
+
+def kill_quietly(pid):
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
 
 
 def git_test_environment():
@@ -918,8 +928,8 @@ class LaunchTests(unittest.TestCase):
             original_popen = subprocess.Popen
             def spawn(*argv, **kwargs):
                 child = original_popen(*argv, **kwargs)
-                # The session guard is started with this interpreter; sessions are the scripts.
-                (guards if argv[0][0] == sys.executable else children).append(child)
+                # The session guard is this file started with a flag; sessions are the gated scripts.
+                (guards if is_guard(argv[0]) else children).append(child)
                 return child
             with patch.object(probe, "doctor", return_value={"target_ready": True}), \
                  patch.object(probe, "verified_binary", return_value=(executable,
@@ -952,8 +962,8 @@ class LaunchTests(unittest.TestCase):
             original_popen, original_stop = subprocess.Popen, probe.stop_child
             def spawn(*argv, **kwargs):
                 child = original_popen(*argv, **kwargs)
-                # The session guard is started with this interpreter; sessions are the scripts.
-                (guards if argv[0][0] == sys.executable else children).append(child)
+                # The session guard is this file started with a flag; sessions are the gated scripts.
+                (guards if is_guard(argv[0]) else children).append(child)
                 return child
             cleaning = threading.Event()
             def stop(child):
@@ -1052,8 +1062,8 @@ class LaunchTests(unittest.TestCase):
             original_popen = subprocess.Popen
             def spawn(*argv, **kwargs):
                 child = original_popen(*argv, **kwargs)
-                # The session guard is started with this interpreter; sessions are the scripts.
-                (guards if argv[0][0] == sys.executable else children).append(child)
+                # The session guard is this file started with a flag; sessions are the gated scripts.
+                (guards if is_guard(argv[0]) else children).append(child)
                 return child
             def hang_up():
                 deadline = time.monotonic() + 10
@@ -1109,34 +1119,47 @@ class LaunchTests(unittest.TestCase):
             finally:
                 signal.signal(signal.SIGHUP, before)
 
-    def test_detached_process_holding_the_pipe_does_not_block(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            executable = root / "leaves-a-detached-process"
-            executable.write_text(f"#!{sys.executable}\nimport subprocess, sys\n"
-                "other = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
-                "                         start_new_session=True)\n"
-                f"open({str(root / 'other.pid')!r}, 'w').write(str(other.pid))\n"
-                "print('WAYWIN_PROBE_V1 driver=wayland', file=sys.stderr, flush=True)\n"
-                "sys.exit(7)\n")
-            executable.chmod(0o700)
-            args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
-                             label="host-a", mode="rail", app="||probe", output=root / "runs",
-                             display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
-            try:
-                with patch.object(probe, "doctor", return_value={"target_ready": True}), \
-                     patch.object(probe, "verified_binary", return_value=(executable,
-                             {"system": "Linux", "native_wayland_helpers": True})), \
-                     patch.object(probe, "GROUP_GRACE", 0.2), \
-                     patch("sys.stdout", new_callable=io.StringIO):
-                    start = time.monotonic()
-                    self.assertEqual(probe.run(args), 1)
-                    self.assertLess(time.monotonic() - start, 20)
-                record = json.loads(next(args.output.glob("*/exit.json")).read_text())
-                self.assertEqual((record["ended"], record["exit_code"], record["events_seen"]), ("session-exit", 7, 1))
-            finally:
-                # It left the session's group on purpose, so the tool cannot and does not end it.
-                os.kill(int((root / "other.pid").read_text()), signal.SIGKILL)
+    def test_process_that_left_the_group_cannot_hold_the_run_open_or_survive_it(self):
+        # Leaving the group keeps the session ID; leaving the session as well is found only by the
+        # run's environment marker, which only Linux exposes to another process.
+        variants = [("group", "os.setpgid(0, 0)")]
+        if sys.platform.startswith("linux"):
+            variants.append(("session", "os.setsid()"))
+        for left, call in variants:
+            with self.subTest(left=left), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                executable = root / "leaves-a-detached-process"
+                executable.write_text(f"#!{sys.executable}\nimport subprocess, sys\n"
+                    f"other = subprocess.Popen([sys.executable, '-c', 'import os, time; {call}; time.sleep(60)'])\n"
+                    f"open({str(root / 'other.pid')!r}, 'w').write(str(other.pid))\n"
+                    "print('WAYWIN_PROBE_V1 driver=wayland', file=sys.stderr, flush=True)\n"
+                    "sys.exit(7)\n")
+                executable.chmod(0o700)
+                args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
+                                 label="host-a", mode="rail", app="||probe", output=root / "runs",
+                                 display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
+                other = None
+                try:
+                    with patch.object(probe, "doctor", return_value={"target_ready": True}), \
+                         patch.object(probe, "verified_binary", return_value=(executable,
+                                 {"system": "Linux", "native_wayland_helpers": True})), \
+                         patch.object(probe, "GROUP_GRACE", 0.2), \
+                         patch("sys.stdout", new_callable=io.StringIO):
+                        start = time.monotonic()
+                        self.assertEqual(probe.run(args), 1)
+                        self.assertLess(time.monotonic() - start, 20)
+                    other = int((root / "other.pid").read_text())
+                    record = json.loads(next(args.output.glob("*/exit.json")).read_text())
+                    self.assertEqual((record["ended"], record["exit_code"], record["events_seen"]),
+                                     ("session-exit", 7, 1))
+                    # Ended before run() returned, not merely afterwards by chance.
+                    self.assertFalse(alive(other), "the process that left the group survived the run")
+                finally:
+                    if other is None and (root / "other.pid").exists():
+                        other = int((root / "other.pid").read_text())
+                    if other:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(other, signal.SIGKILL)
 
     def test_leftover_process_cannot_hold_the_run_open(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1192,9 +1215,11 @@ class LaunchTests(unittest.TestCase):
                 executable = root / "session"
                 executable.write_text(f"#!{sys.executable}\nimport os, signal, subprocess, sys, time\n" +
                     ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignores_term else "") +
-                    # A process the session started stays in its group, like a helper would.
+                    # A process the session started stays in its group, like a helper would;
+                    # another leaves the group and must be found by its session.
                     "member = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
-                    f"open({str(root / 'pids.tmp')!r}, 'w').write(f'{{os.getpid()}} {{member.pid}}')\n"
+                    "other = subprocess.Popen([sys.executable, '-c', 'import os, time; os.setpgid(0, 0); time.sleep(60)'])\n"
+                    f"open({str(root / 'pids.tmp')!r}, 'w').write(f'{{os.getpid()}} {{member.pid}} {{other.pid}}')\n"
                     f"os.rename({str(root / 'pids.tmp')!r}, {str(root / 'pids')!r})\n"
                     "print('WAYWIN_PROBE_V1 driver=wayland', file=sys.stderr, flush=True)\n"
                     "time.sleep(60)\n")
@@ -1241,7 +1266,7 @@ class LaunchTests(unittest.TestCase):
                     while remaining and time.monotonic() < deadline:
                         remaining = [pid for pid in remaining if alive(pid)]
                         time.sleep(0.05)
-                    self.assertEqual(remaining, [], "the session group outlived the killed tool")
+                    self.assertEqual(remaining, [], "the session outlived the killed tool")
                     # No exit record: the tool never got to write one.
                     self.assertEqual(list(root.glob("runs/*/exit.json")), [])
                 finally:
@@ -1251,24 +1276,20 @@ class LaunchTests(unittest.TestCase):
                         with contextlib.suppress(ProcessLookupError):
                             os.kill(pid, signal.SIGKILL)
 
-    def test_guard_only_acts_on_a_lost_tool(self):
+    def test_guard_ends_what_is_left_when_its_pipe_closes(self):
+        marker = "test-" + os.urandom(8).hex()
         def group():
             member = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
                                       start_new_session=True)
             self.addCleanup(lambda: (member.kill(), member.wait()))
             return member
-        # Released after cleanup: the guard exits and leaves the (here still running) group alone.
-        member, guard = group(), probe.start_guard(grace=0.2)
+        # The pipe closes on release and when the tool is killed alike: the group is ended.
+        member, guard = group(), probe.start_guard(marker, grace=0.2)
         self.assertTrue(probe.guard_message(guard, f"{member.pid}\n".encode()))
-        probe.release_guard(guard)
-        self.assertEqual(guard.returncode, 0)
-        self.assertIsNone(member.poll())
-        # Tool lost: the pipe closes without "done" and the group is ended.
-        member, guard = group(), probe.start_guard(grace=0.2)
-        probe.guard_message(guard, f"{member.pid}\n".encode())
         guard.stdin.close()
         self.assertEqual(guard.wait(timeout=10), 0)
         self.assertEqual(member.wait(timeout=10), -signal.SIGTERM)
+        guard.stdout.close()
         # SIGTERM comes first and the group gets the grace period to finish on its own ...
         def handling(code):
             member = subprocess.Popen([sys.executable, "-c",
@@ -1280,24 +1301,317 @@ class LaunchTests(unittest.TestCase):
             self.addCleanup(lambda: (member.kill(), member.wait(), member.stdout.close()))
             self.assertEqual(member.stdout.readline(), b"ready\n")
             return member
-        member, guard = handling(3), probe.start_guard(grace=2.0)
+        member, guard = handling(3), probe.start_guard(marker, grace=2.0)
         probe.guard_message(guard, f"{member.pid}\n".encode())
         guard.stdin.close()
         self.assertEqual(member.wait(timeout=10), 3)
         guard.wait(timeout=10)
-        # ... and only a group still present after it is killed.
-        member, guard = handling(None), probe.start_guard(grace=0.5)
+        guard.stdout.close()
+        # ... and only what is still present after it is killed.
+        member, guard = handling(None), probe.start_guard(marker, grace=0.5)
         probe.guard_message(guard, f"{member.pid}\n".encode())
         started = time.monotonic()
         guard.stdin.close()
         self.assertEqual(member.wait(timeout=10), -signal.SIGKILL)
         self.assertGreaterEqual(time.monotonic() - started, 0.4)
         guard.wait(timeout=10)
+        guard.stdout.close()
+        # A process that left the group is found by the session ID it kept.
+        leader = subprocess.Popen([sys.executable, "-c",
+            "import subprocess, sys, time\n"
+            "other = subprocess.Popen([sys.executable, '-c', 'import os, time; os.setpgid(0, 0); "
+            "print(os.getpid(), flush=True); time.sleep(60)'])\n"
+            "time.sleep(60)\n"], stdout=subprocess.PIPE, start_new_session=True)
+        self.addCleanup(lambda: (leader.kill(), leader.wait(), leader.stdout.close()))
+        other = int(leader.stdout.readline())
+        self.addCleanup(kill_quietly, other)
+        self.assertNotEqual(os.getpgid(other), leader.pid)
+        guard = probe.start_guard(marker, grace=0.2)
+        probe.guard_message(guard, f"{leader.pid}\n".encode())
+        guard.stdin.close()
+        self.assertEqual(guard.wait(timeout=10), 0)
+        guard.stdout.close()
+        leader.wait(timeout=10)
+        deadline = time.monotonic() + 5
+        while alive(other) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(alive(other))
+        # SIGTERM to the guard itself ends the run too, while the tool still holds the pipe.
+        member, guard = group(), probe.start_guard(marker, grace=0.2)
+        probe.guard_message(guard, f"{member.pid}\n".encode())
+        time.sleep(0.2)
+        guard.terminate()
+        self.assertEqual(member.wait(timeout=10), -signal.SIGTERM)
+        self.assertEqual(guard.wait(timeout=10), 0)
+        guard.stdin.close()
+        guard.stdout.close()
+        # A second SIGTERM does not cut the cleanup short: what ignores SIGTERM is still killed.
+        member, guard = handling(None), probe.start_guard(marker, grace=1.5)
+        probe.guard_message(guard, f"{member.pid}\n".encode())
+        time.sleep(0.2)
+        guard.terminate()
+        time.sleep(0.4)
+        guard.terminate()
+        self.assertEqual(member.wait(timeout=10), -signal.SIGKILL)
+        self.assertEqual(guard.wait(timeout=10), 0)
+        guard.stdin.close()
+        guard.stdout.close()
+        # Killing the stuck tool by a pattern of its command line does not also kill the guard.
+        command = " ".join(probe.guard_command(marker, 3.0, None))
+        for word in ("probe.py", "waywin", "tools/"):
+            self.assertNotIn(word, command)
         # Signals to the tool's terminal or group do not reach it: it has its own session.
-        guard = probe.start_guard()
-        self.addCleanup(lambda: (guard.stdin.close(), guard.kill(), guard.wait()))
+        guard = probe.start_guard(marker)
+        self.addCleanup(lambda: (guard.stdin.close(), guard.kill(), guard.wait(), guard.stdout.close()))
         self.assertNotEqual(os.getpgid(guard.pid), os.getpgrp())
         self.assertEqual(os.getsid(guard.pid), guard.pid)
+        guard.send_signal(signal.SIGINT)
+        guard.send_signal(signal.SIGHUP)
+        time.sleep(0.3)
+        self.assertIsNone(guard.poll())
+
+    def test_gate_opens_only_after_registration(self):
+        marker = "test-" + os.urandom(8).hex()
+        for registered in (True, False):
+            with self.subTest(registered=registered):
+                read, write = os.pipe()
+                try:
+                    guard = probe.start_guard(marker, grace=0.2, gate=write)
+                finally:
+                    os.close(write)
+                try:
+                    if registered:
+                        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                                  start_new_session=True)
+                        self.addCleanup(lambda: (holder.kill(), holder.wait()))
+                        probe.guard_message(guard, f"{holder.pid}\n".encode())
+                    else:
+                        guard.stdin.close()  # The tool was killed before it registered anything.
+                    self.assertTrue(select.select([read], [], [], 10)[0])
+                    self.assertEqual(os.read(read, 1), b"g" if registered else b"")
+                finally:
+                    os.close(read)
+                    with contextlib.suppress(OSError):
+                        guard.stdin.close()
+                    guard.wait(timeout=10)
+                    guard.stdout.close()
+        # The gate program starts the session only on that byte, with its own process ID and
+        # exactly the environment it was given (not the tool's, which the gate itself runs with).
+        for opened in (True, False):
+            with self.subTest(opened=opened), tempfile.TemporaryDirectory() as directory:
+                read, write = os.pipe()
+                target = Path(directory) / "started"
+                environment = {"ONLY": "this", "LARGE": "x" * 200_000}  # Beyond any pipe buffer.
+                try:
+                    with patch.dict(os.environ, {"TOOL_ONLY": "1"}):
+                        child = probe.start_gated([sys.executable, "-c",
+                            "import json, os, sys\n"
+                            f"open({str(target)!r}, 'w').write(json.dumps([os.getpid(), sorted(os.environ)]))"],
+                            environment, read)
+                finally:
+                    os.close(read)
+                if opened:
+                    os.write(write, b"g")
+                os.close(write)
+                code = child.wait(timeout=10)
+                if opened:
+                    pid, names = json.loads(target.read_text())
+                    self.assertEqual(code, 0)
+                    self.assertEqual(pid, child.pid)
+                    # The target itself may add its locale coercion or macOS text encoding variable.
+                    self.assertEqual(set(names) - {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}, {"ONLY", "LARGE"})
+                else:
+                    self.assertEqual(code, 125)
+                    self.assertFalse(target.exists())
+
+    @unittest.skipUnless(shutil.which("perl"), "perl reports inherited signal dispositions")
+    def test_gate_leaves_the_signal_dispositions_of_a_direct_start(self):
+        script = 'print "[$SIG{PIPE}][$SIG{XFSZ}]"'
+        direct = subprocess.run(["perl", "-e", script], capture_output=True, check=True).stdout
+        read, write = os.pipe()
+        try:
+            child = probe.start_gated([shutil.which("perl"), "-e", script], dict(os.environ), read,
+                                      stdout=subprocess.PIPE)
+        finally:
+            os.close(read)
+        os.write(write, b"g")
+        os.close(write)
+        output, _ = child.communicate(timeout=10)
+        self.assertEqual((output, direct), (b"[][]", b"[][]"))
+
+    def test_sweep_continues_until_nothing_new_appears(self):
+        # A session member that keeps starting processes while it is ended: some start after the
+        # listing that finds it and before it is killed, and only a later scan finds those.
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "pids"
+            spawner = subprocess.Popen([sys.executable, "-c",
+                "import os, signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"  # Inherited by every sleep.
+                f"out = open({str(record)!r}, 'a')\n"
+                "while True:\n"
+                "    pid = os.posix_spawn('/bin/sleep', ['sleep', '60'], os.environ)\n"
+                "    out.write(f'{pid}\\n'); out.flush()\n"
+                "    time.sleep(0.002)\n"], start_new_session=True)
+            self.addCleanup(lambda: (spawner.kill(), spawner.wait()))
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and len(record.read_text().split()) < 20 if record.exists() \
+                    else time.monotonic() < deadline:
+                time.sleep(0.02)
+            probe.end_session(spawner.pid, "unused-" + os.urandom(8).hex(), 0.2)
+            self.assertEqual(spawner.wait(timeout=10), -signal.SIGKILL)
+            pids = [int(value) for value in record.read_text().split()]
+            for pid in pids:
+                self.addCleanup(kill_quietly, pid)
+            deadline = time.monotonic() + 5
+            while any(alive(pid) for pid in pids) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual([pid for pid in pids if alive(pid)], [])
+
+    def test_processes_of_the_run_are_found_in_linux_proc(self):
+        # Real processes listed in a synthetic /proc: the parsing and selection are Linux's; the
+        # signals are real. Each is orphaned so that it is reaped as soon as it ends.
+        def orphan():
+            pid = int(subprocess.run(["/bin/sh", "-c", "sleep 60 </dev/null >/dev/null 2>&1 & echo $!"],
+                                     capture_output=True, check=True).stdout)
+            self.addCleanup(kill_quietly, pid)
+            return pid
+        marker, group = "run-" + os.urandom(8).hex(), 999_999_001
+        tagged, in_group, in_session, unrelated, near_miss, zombie = (orphan() for _ in range(6))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def entry(pid, comm, state, pgid, session, environ):
+                (root / str(pid)).mkdir()
+                (root / str(pid) / "stat").write_bytes(
+                    f"{pid} ({comm}) {state} 1 {pgid} {session} 0 -1 4194560 0 0".encode())
+                if environ is not None:
+                    (root / str(pid) / "environ").write_bytes(b"\0".join(environ) + b"\0")
+            mark = f"WAYWIN_PROBE_RUN={marker}".encode()
+            entry(tagged, "a) (b c", "S", tagged, tagged, [b"HOME=/x", mark])
+            entry(in_group, "helper", "S", group, in_group, [])
+            entry(in_session, "helper", "S", in_session, group, None)  # Hidden environment.
+            entry(unrelated, "other", "S", unrelated, unrelated, [b"HOME=/x"])
+            entry(near_miss, "other", "S", near_miss, near_miss, [mark + b"0", b"X" + mark])
+            entry(os.getpid(), "self", "S", group, group, [mark])
+            entry(999_999_002, "gone", "S", group, group, [mark])  # Exited since the listing.
+            entry(zombie, "zombie", "Z", group, group, [mark])  # Live here, so only its state excludes it.
+            (root / "self").mkdir()
+            (root / "notapid").write_text("")
+            self.assertEqual(probe.session_processes(group, marker, root), {tagged, in_group, in_session})
+            self.assertEqual(probe.session_processes(None, marker, root), {tagged})
+            probe.end_session(group, marker, 0.2, root)
+            deadline = time.monotonic() + 5
+            while any(alive(pid) for pid in (tagged, in_group, in_session)) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual([alive(pid) for pid in (tagged, in_group, in_session, unrelated, near_miss, zombie)],
+                             [False, False, False, True, True, True])
+
+    def test_killed_guard_ends_the_session(self):
+        # Without its guard the session would outlive a later SIGKILL of the tool, so the tool ends
+        # it. A replacement guard then ends what left the group, as a normal release would.
+        for number in (signal.SIGKILL, signal.SIGTERM):
+            with self.subTest(signal=number.name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                executable = root / "session"
+                executable.write_text(f"#!{sys.executable}\nimport os, subprocess, sys, time\n"
+                    "member = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                    "other = subprocess.Popen([sys.executable, '-c', 'import os, time; os.setpgid(0, 0); time.sleep(60)'])\n"
+                    f"open({str(root / 'pids')!r}, 'w').write(f'{{os.getpid()}} {{member.pid}} {{other.pid}}')\n"
+                    "print('WAYWIN_PROBE_V1 driver=wayland', file=sys.stderr, flush=True)\n"
+                    "time.sleep(60)\n")
+                executable.chmod(0o700)
+                args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
+                                 label="host-a", mode="rail", app="||probe", output=root / "runs",
+                                 display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
+                children, guards = [], []
+                original_popen = subprocess.Popen
+                def spawn(*argv, **kwargs):
+                    child = original_popen(*argv, **kwargs)
+                    (guards if is_guard(argv[0]) else children).append(child)
+                    return child
+                def kill_guard():
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline and not any(
+                            path.stat().st_size for path in args.output.glob("*/events.jsonl")):
+                        time.sleep(0.02)
+                    guards[0].send_signal(number)
+                killer = threading.Thread(target=kill_guard)
+                pids = []
+                try:
+                    with patch.object(probe, "doctor", return_value={"target_ready": True}), \
+                         patch.object(probe, "verified_binary", return_value=(executable,
+                                 {"system": "Linux", "native_wayland_helpers": True})), \
+                         patch.object(probe.subprocess, "Popen", side_effect=spawn), \
+                         patch("sys.stdout", new_callable=io.StringIO):
+                        killer.start()
+                        started = time.monotonic()
+                        if number == signal.SIGKILL:
+                            with self.assertRaises(probe.ProbeError) as raised:
+                                probe.run(args)
+                            self.assertIn("guard was stopped", str(raised.exception))
+                        else:
+                            # The guard ends the session itself, so the session may be seen ending
+                            # before the guard is: either record is correct.
+                            with contextlib.suppress(probe.ProbeError):
+                                probe.run(args)
+                        self.assertLess(time.monotonic() - started, 30)
+                    killer.join()
+                    pids = [int(value) for value in (root / "pids").read_text().split()]
+                    self.assertEqual([pid for pid in pids if alive(pid)], [])
+                    self.assertTrue(all(guard.poll() is not None for guard in guards))
+                    ended = json.loads(next(args.output.glob("*/exit.json")).read_text())["ended"]
+                    if number == signal.SIGKILL:
+                        self.assertEqual((ended, len(guards)), ("aborted", 2))
+                    else:
+                        self.assertIn(ended, ("aborted", "session-exit"))
+                finally:
+                    killer.join()
+                    for pid in pids:
+                        kill_quietly(pid)
+                    for child in children:
+                        probe.stop_child(child, timeout=0.1)
+
+    def test_tool_killed_before_registration_never_starts_the_session(self):
+        # The instant between starting the session and telling the guard about it: the session
+        # waits at the gate, which closes with the guard, so it ends without running.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            executable = root / "session"
+            executable.write_text(f"#!{sys.executable}\nopen({str(root / 'started')!r}, 'w').close()\n")
+            executable.chmod(0o700)
+            harness = root / "harness.py"
+            harness.write_text(
+                "import importlib.util, os, signal\nfrom argparse import Namespace\nfrom pathlib import Path\n"
+                "from unittest.mock import patch\n"
+                f"spec = importlib.util.spec_from_file_location('probe', {str(ROOT / 'tools/probe.py')!r})\n"
+                "probe = importlib.util.module_from_spec(spec); spec.loader.exec_module(probe)\n"
+                "def message(guard, data):\n"
+                f"    open({str(root / 'gated.tmp')!r}, 'wb').write(data)\n"
+                f"    os.rename({str(root / 'gated.tmp')!r}, {str(root / 'gated')!r})\n"
+                "    os.kill(os.getpid(), signal.SIGKILL)\n"
+                "probe.guard_message = message\n"
+                f"args = Namespace(manifest=Path('m'), server='example.test', user='alice', domain='',\n"
+                f"    label='host-a', mode='rail', app='||probe', output=Path({str(root / 'runs')!r}),\n"
+                "    display_mode='auto', monitors=None, size=None, dynamic_resolution=False)\n"
+                "with patch.object(probe, 'doctor', return_value={'target_ready': True}), \\\n"
+                f"     patch.object(probe, 'verified_binary', return_value=(Path({str(executable)!r}),\n"
+                "         {'system': 'Linux', 'native_wayland_helpers': True})):\n"
+                "    probe.run(args)\n")
+            tool = subprocess.Popen([sys.executable, harness], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            gated = None
+            try:
+                self.assertEqual(tool.wait(timeout=20), -signal.SIGKILL)
+                gated = int((root / "gated").read_text())
+                deadline = time.monotonic() + 10
+                while alive(gated) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(alive(gated), "the gated session outlived the killed tool")
+                self.assertFalse((root / "started").exists())
+            finally:
+                tool.kill()
+                tool.wait()
+                if gated:
+                    kill_quietly(gated)
 
     def test_session_is_not_started_without_a_working_guard(self):
         with tempfile.TemporaryDirectory() as directory:
