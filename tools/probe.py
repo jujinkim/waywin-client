@@ -86,11 +86,13 @@ def command(args: list[str | Path], *, capture: bool = False, env: dict | None =
 
 
 def source_diff() -> str:
-    # The text is compared byte for byte with the approved patch, so every user setting that
-    # shapes it is pinned. Otherwise a correct checkout is reported as modified.
+    # The text is compared byte for byte with the approved patch, so user and system settings
+    # that shape it are pinned. Otherwise a correct checkout is reported as modified.
     env = {key: value for key, value in os.environ.items()
            if key not in ("GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF")}
+    env["GIT_ATTR_NOSYSTEM"] = "1"
     return command(["git", "-C", SOURCE, "-c", "core.quotePath=true", "-c", "diff.suppressBlankEmpty=false",
+                    "-c", "core.attributesFile=" + os.devnull,
                     "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
                     "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "--inter-hunk-context=0",
                     "--diff-algorithm=myers", "--indent-heuristic", "--abbrev=7", "HEAD"],

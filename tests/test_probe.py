@@ -288,7 +288,10 @@ class ProvenanceTests(unittest.TestCase):
             settings = root / "gitconfig"
             settings.write_text("[diff]\n\tnoprefix = true\n\tmnemonicPrefix = true\n\tcontext = 7\n"
                                 "\tinterHunkContext = 5\n\talgorithm = patience\n\tsuppressBlankEmpty = true\n"
-                                "[core]\n\tabbrev = 12\n[color]\n\tui = always\n")
+                                "\tindentHeuristic = false\n"
+                                f"[core]\n\tabbrev = 12\n\tattributesFile = {root / 'attributes'}\n"
+                                "[color]\n\tui = always\n")
+            (root / "attributes").write_text("*.txt -diff\n")
             hostile = {"GIT_CONFIG_GLOBAL": str(settings), "GIT_DIFF_OPTS": "--unified=9"}
             self.assertNotEqual(git("diff", "--binary", "--no-ext-diff", "HEAD", env={**clean, **hostile}), approved)
             with patch.object(probe, "SOURCE", source), patch.dict(os.environ, {**clean, **hostile}):
