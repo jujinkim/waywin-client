@@ -267,6 +267,33 @@ class ProvenanceTests(unittest.TestCase):
     def test_patch_lock_matches(self):
         self.assertEqual(probe.sha256(probe.PATCH), probe.lock()["freerdp"]["probe_patch_sha256"])
 
+    def test_patch_comparison_ignores_user_git_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            clean = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+            clean.pop("GIT_DIFF_OPTS", None)
+            def git(*arguments, env=clean):
+                return subprocess.run(["git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@localhost",
+                                       *arguments], check=True, capture_output=True, text=True, env=env).stdout
+            lines = [f"line {number}\n" for number in range(40)]
+            (source / "file.txt").write_text("".join(lines))
+            git("init", "--quiet")
+            git("add", "file.txt")
+            git("commit", "--quiet", "--message", "base")
+            lines[5] = lines[30] = "changed\n"
+            (source / "file.txt").write_text("".join(lines))
+            approved = git("diff", "--binary", "--no-ext-diff", "HEAD")
+            settings = root / "gitconfig"
+            settings.write_text("[diff]\n\tnoprefix = true\n\tmnemonicPrefix = true\n\tcontext = 7\n"
+                                "\tinterHunkContext = 5\n\talgorithm = patience\n\tsuppressBlankEmpty = true\n"
+                                "[core]\n\tabbrev = 12\n[color]\n\tui = always\n")
+            hostile = {"GIT_CONFIG_GLOBAL": str(settings), "GIT_DIFF_OPTS": "--unified=9"}
+            self.assertNotEqual(git("diff", "--binary", "--no-ext-diff", "HEAD", env={**clean, **hostile}), approved)
+            with patch.object(probe, "SOURCE", source), patch.dict(os.environ, {**clean, **hostile}):
+                self.assertEqual(probe.source_diff(), approved)
+
     def test_binary_tampering_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "binary"

@@ -78,11 +78,23 @@ def lock() -> dict:
     return json.loads(LOCK_PATH.read_text())
 
 
-def command(args: list[str | Path], *, capture: bool = False) -> str:
+def command(args: list[str | Path], *, capture: bool = False, env: dict | None = None) -> str:
     result = subprocess.run([str(a) for a in args], check=True,
                             stdout=subprocess.PIPE if capture else None,
-                            text=True)
+                            text=True, env=env)
     return result.stdout or ""
+
+
+def source_diff() -> str:
+    # The text is compared byte for byte with the approved patch, so every user setting that
+    # shapes it is pinned. Otherwise a correct checkout is reported as modified.
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF")}
+    return command(["git", "-C", SOURCE, "-c", "core.quotePath=true", "-c", "diff.suppressBlankEmpty=false",
+                    "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
+                    "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "--inter-hunk-context=0",
+                    "--diff-algorithm=myers", "--indent-heuristic", "--abbrev=7", "HEAD"],
+                   capture=True, env=env)
 
 
 def private_json(path: Path, data: dict) -> None:
@@ -106,14 +118,14 @@ def prepare() -> None:
     # Do not discard developer changes or apply the patch twice.
     if command(["git", "-C", SOURCE, "ls-files", "--others", "--exclude-standard"], capture=True):
         raise ProbeError("Untracked files in dependency source; inspect them first")
-    changes = command(["git", "-C", SOURCE, "diff", "--binary", "--no-ext-diff", "HEAD"], capture=True)
+    changes = source_diff()
     expected = PATCH.read_text()
     if changes and changes != expected:
         raise ProbeError("Dependency has changes other than the approved observer patch")
     if not changes:
         command(["git", "-C", SOURCE, "apply", "--check", PATCH])
         command(["git", "-C", SOURCE, "apply", PATCH])
-    if command(["git", "-C", SOURCE, "diff", "--binary", "--no-ext-diff", "HEAD"], capture=True) != expected:
+    if source_diff() != expected:
         raise ProbeError("Applied patch differs from expected patch")
 
 
