@@ -342,7 +342,7 @@ def display_config(mode: str, display_mode: str = "auto", monitors: str | None =
 
 def rdp_args(binary: Path, server: str, user: str, domain: str, label: str,
              mode: str, app: str | None, *, display_mode: str = "auto", monitors: str | None = None,
-             size: str | None = None, dynamic: bool = False) -> list[str]:
+             size: str | None = None, dynamic: bool = False, launch: bool = True) -> list[str]:
     display = display_config(mode, display_mode, monitors, size, dynamic)
     if "\\" in user:
         # FreeRDP would split DOMAIN\\user itself; the domain has its own option here.
@@ -363,12 +363,18 @@ def rdp_args(binary: Path, server: str, user: str, domain: str, label: str,
     args.append("+dynamic-resolution" if dynamic else "-dynamic-resolution")
     if domain:
         args.append(f"/d:{text_option(domain, 'domain')}")
-    if mode == "rail":
+    if mode == "rail" and not launch:
+        if app:
+            raise ProbeError("Use either --app or --no-launch")
+        # An empty program enables RAIL while the pinned client skips its start order, so an
+        # existing session is joined without starting a second copy of anything.
+        args.append("/app:program:")
+    elif mode == "rail":
         if not app or "," in app:
             raise ProbeError("RAIL requires one registered alias or executable path without commas")
         args.append(f"/app:program:{text_option(app, 'app')}")
-    elif mode != "desktop" or app:
-        raise ProbeError("An app is accepted only in rail mode")
+    elif mode != "desktop" or app or not launch:
+        raise ProbeError("An app or --no-launch is accepted only in rail mode")
     return args
 
 
@@ -491,15 +497,16 @@ def run(args) -> int:
     if provenance["system"] != "Linux" or not provenance["native_wayland_helpers"]:
         raise ProbeError("This binary was not built with Linux native Wayland helpers")
     display = display_config(args.mode, args.display_mode, args.monitors, args.size, args.dynamic_resolution)
+    launch = not getattr(args, "no_launch", False)
     argv = rdp_args(binary, args.server, args.user, args.domain, args.label, args.mode, args.app,
                     display_mode=args.display_mode, monitors=args.monitors, size=args.size,
-                    dynamic=args.dynamic_resolution)
+                    dynamic=args.dynamic_resolution, launch=launch)
     run_id = str(uuid.uuid4())
     directory = args.output / run_id
     directory.mkdir(parents=True, mode=0o700)
     private_json(directory / "run.json", {
         "schema": 1, "run_id": run_id, "host_label": args.label, "mode": args.mode,
-        "requested_display": display,
+        "requested_display": display, "program_start_requested": args.mode == "rail" and launch,
         "environment": environment, "build": provenance, "pass": False,
         "note": "Observer events establish reception only; complete manual cases separately.",
     })
@@ -671,7 +678,9 @@ def main() -> int:
     runner.add_argument("--domain", default="")
     runner.add_argument("--label", required=True, help="Non-sensitive host label, e.g. host-a")
     runner.add_argument("--mode", choices=["desktop", "rail"], required=True)
-    runner.add_argument("--app")
+    runner.add_argument("--app", help="RAIL: registered alias or executable path to start")
+    runner.add_argument("--no-launch", action="store_true",
+                        help="RAIL: join the existing session without starting a program (experimental)")
     runner.add_argument("--display-mode", choices=["auto", "window", "multimon"], default="auto",
                         help="auto: desktop window or RAIL monitor layout")
     runner.add_argument("--monitors", help="Comma-separated SDL IDs from list-monitors; first is primary")

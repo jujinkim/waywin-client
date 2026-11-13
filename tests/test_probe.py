@@ -59,6 +59,13 @@ class EndpointTests(unittest.TestCase):
         with self.assertRaises(probe.ProbeError):
             probe.rdp_args(Path("binary"), "pc", "alice", "", "a", "desktop", "notepad")
 
+    def test_rail_can_join_without_starting_a_program(self):
+        argv = probe.rdp_args(Path("binary"), "pc", "alice", "", "a", "rail", None, launch=False)
+        self.assertEqual(argv[-1], "/app:program:")
+        for mode, app in (("rail", "||probe"), ("desktop", None), ("desktop", "notepad")):
+            with self.subTest(mode=mode, app=app), self.assertRaises(probe.ProbeError):
+                probe.rdp_args(Path("binary"), "pc", "alice", "", "a", mode, app, launch=False)
+
     def test_text_options_reject_control_characters_and_embedded_domain(self):
         base = dict(server="pc", user="alice", domain="ACME", label="host-a")
         for field, value in (("user", "ACME\\alice"), ("user", ""), ("user", "a\nb"), ("user", "a" * 257),
@@ -661,6 +668,7 @@ class LaunchTests(unittest.TestCase):
                 self.assertFalse(run_record["pass"])
                 self.assertEqual(run_record["requested_display"], {"mode": "multimon", "monitor_ids": [2, 1],
                     "window_size": None, "dynamic_resolution": True})
+                self.assertTrue(run_record["program_start_requested"])
                 self.assertNotIn("SECRET-SENTINEL", "".join(p.read_text() for p in run.iterdir()))
                 self.assertEqual(json.loads((run / "exit.json").read_text()), {
                     "ended": "session-exit", "exit_code": 0, "sdl_driver_observed": "wayland",
