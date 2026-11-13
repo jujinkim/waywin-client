@@ -81,7 +81,7 @@ def sha256(path: Path) -> str:
 
 
 def lock() -> dict:
-    return json.loads(LOCK_PATH.read_text())
+    return json.loads(LOCK_PATH.read_text(encoding="utf-8"))
 
 
 def command(args: list[str | Path], *, step: str, capture: bool = False, env: dict | None = None) -> str:
@@ -89,7 +89,7 @@ def command(args: list[str | Path], *, step: str, capture: bool = False, env: di
     try:
         result = subprocess.run([str(a) for a in args], check=True,
                                 stdout=subprocess.PIPE if capture else None,
-                                text=True, env=env)
+                                text=True, encoding="utf-8", env=env)
     except FileNotFoundError:
         raise ProbeError(f"{step}: the program is not installed or not on PATH") from None
     except subprocess.CalledProcessError as error:
@@ -131,7 +131,7 @@ def source_diff() -> str:
 def private_json(path: Path, data: dict) -> None:
     # Never overwrite a previous run; don't follow an existing file/symlink.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as stream:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
         json.dump(data, stream, indent=2, ensure_ascii=False)
         stream.write("\n")
 
@@ -163,7 +163,7 @@ def prepare() -> None:
                step="Listing untracked dependency files", capture=True):
         raise ProbeError("Untracked files in dependency source; inspect them first")
     changes = source_diff()
-    expected = PATCH.read_text()
+    expected = PATCH.read_text(encoding="utf-8")
     if changes and changes != expected:
         raise ProbeError("Dependency has changes other than the approved observer patch")
     if not changes:
@@ -179,7 +179,7 @@ def dependency_inventory(cache: str) -> dict:
     for name in ("SDL3", "SDL3_ttf", "json-c", "cJSON"):
         directory = Path(entries.get(name + "_DIR", "missing"))
         for version_file in directory.glob("*[Vv]ersion.cmake"):
-            match = re.search(r'set\(PACKAGE_VERSION "([^"]+)"\)', version_file.read_text())
+            match = re.search(r'set\(PACKAGE_VERSION "([^"]+)"\)', version_file.read_text(encoding="utf-8"))
             if match:
                 result[name] = match[1]
                 break
@@ -188,7 +188,7 @@ def dependency_inventory(cache: str) -> dict:
             ("zlib", "ZLIB_INCLUDE_DIR", "zlib.h", r'ZLIB_VERSION\s+"([^"]+)"')):
         header = Path(entries.get(key, "missing")) / relative
         if header.is_file():
-            match = re.search(pattern, header.read_text())
+            match = re.search(pattern, header.read_text(encoding="utf-8"))
             if match:
                 result[name] = match[1]
     return result
@@ -210,11 +210,11 @@ def build(jobs: int) -> None:
     version = command([binary, "/version"], step="Reading the built client's version", capture=True).strip()
     if not re.search(r"\b3\.33\.1\b", version):
         raise ProbeError("Unexpected FreeRDP version")
-    compiles = (BUILD / "compile_commands.json").read_text()
+    compiles = (BUILD / "compile_commands.json").read_text(encoding="utf-8")
     native = "WITH_SDL_WAYLAND_NATIVE" in compiles
     if platform.system() == "Linux" and not native:
         raise ProbeError("SDL native Wayland helpers missing; install wayland-client/scanner/protocols")
-    cache = (BUILD / "CMakeCache.txt").read_text()
+    cache = (BUILD / "CMakeCache.txt").read_text(encoding="utf-8")
     private_json(manifest, {
         "schema": 1, "source_commit": lock()["freerdp"]["commit"],
         "patch_sha256": sha256(PATCH), "profile_sha256": sha256(PROFILE),
@@ -407,7 +407,7 @@ def reap_group_after_exit(child: subprocess.Popen) -> None:
 
 def verified_binary(manifest_path: Path) -> tuple[Path, dict]:
     try:
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raise ProbeError("Build manifest missing or unreadable; run build first") from None
     if not isinstance(manifest, dict):
@@ -487,7 +487,7 @@ def run(args) -> int:
                 for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
         fd = os.open(directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as output:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
             child = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                      start_new_session=True)
@@ -665,7 +665,7 @@ def main() -> int:
         elif args.action == "new-report":
             private_json(args.path, report_template())
         elif args.action == "assess":
-            problems = assess(json.loads(args.path.read_text()))
+            problems = assess(json.loads(args.path.read_text(encoding="utf-8")))
             print(json.dumps({"record_complete": not problems, "problems": problems,
                               "independently_verified": False}, indent=2))
             return 2 if problems else 0

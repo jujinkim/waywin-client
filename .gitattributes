@@ -1,3 +1,5 @@
 # Unified patches contain mandatory context prefixes before upstream tabs/blanks.
 # Check their applied source for whitespace; do not normalize the patch bytes.
-patches/*.patch -whitespace
+# -text: no line-ending conversion either. The lock pins the SHA-256 of these exact bytes,
+# and a CRLF checkout (Git for Windows default) would no longer match it.
+patches/*.patch -whitespace -text
