@@ -5,6 +5,8 @@ target_compile_definitions(waywin-windows-probe PRIVATE
 target_link_libraries(waywin-windows-probe PRIVATE user32 gdi32 shell32 ole32)
 if(MSVC)
   target_compile_options(waywin-windows-probe PRIVATE /W4 /WX /utf-8)
+  # probe.rc embeds the manifest; a second, linker-generated one is a duplicate resource.
+  target_link_options(waywin-windows-probe PRIVATE /MANIFEST:NO)
 else()
   target_compile_options(waywin-windows-probe PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
