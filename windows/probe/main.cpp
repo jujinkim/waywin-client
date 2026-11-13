@@ -109,11 +109,11 @@ NOTIFYICONDATAW iconData() {
     return data;
 }
 
-void trayOperation(DWORD operation) {
+bool trayOperation(DWORD operation) {
     auto data = iconData();
     if (!Shell_NotifyIconW(operation, &data)) {
         lastAction = L"Tray operation failed. Record failure; no support can be inferred.";
-        return;
+        return false;
     }
     if (operation == NIM_ADD) {
         trayPresent = true;
@@ -122,12 +122,13 @@ void trayOperation(DWORD operation) {
             Shell_NotifyIconW(NIM_DELETE, &data);
             trayPresent = false;
             lastAction = L"Tray version 4 failed; icon removed.";
-            return;
+            return false;
         }
     } else if (operation == NIM_DELETE) {
         trayPresent = false;
     }
     lastAction = L"Tray API succeeded. Separately check client icon rendering and interaction.";
+    return true;
 }
 
 void createDocument() {
@@ -211,7 +212,11 @@ void perform(UINT command) {
         else lastAction = L"Tray icon already present.";
         break;
     case ChangeTray:
-        if (trayPresent) { alternateIcon = !alternateIcon; trayOperation(NIM_MODIFY); }
+        if (trayPresent) {
+            alternateIcon = !alternateIcon;
+            // Keep the displayed state equal to the icon the shell actually has.
+            if (!trayOperation(NIM_MODIFY)) alternateIcon = !alternateIcon;
+        }
         else lastAction = L"Add an icon first.";
         break;
     case RemoveTray:
@@ -261,6 +266,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     if (taskbarCreated && message == taskbarCreated && main && trayPresent) {
         trayPresent = false;
         trayOperation(NIM_ADD);
+        refreshStatus();
         return 0;
     }
     switch (message) {
@@ -313,12 +319,17 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             SetForegroundWindow(mainWindow);
             refreshStatus();
         } else if (LOWORD(lParam) == WM_CONTEXTMENU) {
-            ++trayMenus;
             POINT point{GET_X_LPARAM(wParam), GET_Y_LPARAM(wParam)};
             if (point.x == -1 && point.y == -1) GetCursorPos(&point);
             const HMENU menu = CreatePopupMenu();
-            AppendMenuW(menu, MF_STRING, NewWindow, L"New probe window");
-            AppendMenuW(menu, MF_STRING, ChangeTray, L"Change icon");
+            if (!menu || !AppendMenuW(menu, MF_STRING, NewWindow, L"New probe window") ||
+                !AppendMenuW(menu, MF_STRING, ChangeTray, L"Change icon")) {
+                if (menu) DestroyMenu(menu);
+                lastAction = L"Tray menu could not be created; the request was not counted.";
+                refreshStatus();
+                return 0;
+            }
+            ++trayMenus;  // Counts menus that were actually shown.
             SetForegroundWindow(mainWindow);
             const UINT selected = static_cast<UINT>(TrackPopupMenu(menu,
                 TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, mainWindow, nullptr));
@@ -358,6 +369,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 int WINAPI wWinMain(HINSTANCE appInstance, HINSTANCE, PWSTR, int show) {
     instance = appInstance;
     started = GetTickCount64();
+    // ShellExecuteW may activate COM handlers (the ms-settings: pages do).
+    const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
     GUID guid{};
     wchar_t buffer[40]{};
     if (FAILED(CoCreateGuid(&guid)) || !StringFromGUID2(guid, buffer, 40) ||
@@ -382,11 +395,15 @@ int WINAPI wWinMain(HINSTANCE appInstance, HINSTANCE, PWSTR, int show) {
     MSG message{};
     BOOL result = 0;
     while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+        // Escape would reach a window as a cancel or close request and silently destroy a
+        // document window with its test text. Menus and message boxes run their own loops.
+        if (message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) continue;
         const HWND root = GetAncestor(message.hwnd, GA_ROOT);
         if (!root || !IsDialogMessageW(root, &message)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
+    if (comReady) CoUninitialize();
     return result == -1 ? 1 : 0;
 }

@@ -11,5 +11,7 @@ else()
   target_compile_options(waywin-windows-probe PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
 if(MINGW)
-  target_link_options(waywin-windows-probe PRIVATE -municode -static -static-libgcc -static-libstdc++)
+  target_link_options(waywin-windows-probe PRIVATE -municode -static -static-libgcc -static-libstdc++
+    -Wl,--dynamicbase,--nxcompat,--high-entropy-va)
+  target_compile_options(waywin-windows-probe PRIVATE -fstack-protector-strong)
 endif()
