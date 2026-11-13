@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -21,6 +22,13 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("probe", ROOT / "tools/probe.py")
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
+
+
+def git_test_environment():
+    # The tests' own git calls must not follow a hook's GIT_DIR/GIT_INDEX_FILE into the caller's
+    # repository either. Replacement objects stay visible so tests can show their effect.
+    env = {key: value for key, value in probe.git_environment().items() if key != "GIT_NO_REPLACE_OBJECTS"}
+    return {**env, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 
 
 class EndpointTests(unittest.TestCase):
@@ -373,7 +381,7 @@ class ProvenanceTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source"
             source.mkdir()
-            clean = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+            clean = git_test_environment()
             clean.pop("GIT_DIFF_OPTS", None)
             def git(*arguments, env=clean):
                 return subprocess.run(["git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@localhost",
@@ -401,11 +409,17 @@ class ProvenanceTests(unittest.TestCase):
                                 "[color]\n\tui = always\n")
             (root / "attributes").write_text("*.txt -diff\n")
             (root / "order").write_text("file.txt\na.txt\n")
+            # An attribute tree in the object store (git 2.40+ reads it through GIT_ATTR_SOURCE).
+            blob = subprocess.run(["git", "-C", source, "hash-object", "-w", "--stdin"], input="*.txt -diff\n",
+                                  check=True, capture_output=True, text=True, env=clean).stdout.strip()
+            tree = subprocess.run(["git", "-C", source, "mktree"], input=f"100644 blob {blob}\t.gitattributes\n",
+                                  check=True, capture_output=True, text=True, env=clean).stdout.strip()
             hostile = {"GIT_CONFIG_GLOBAL": str(settings), "GIT_DIFF_OPTS": "--unified=9",
                        "GIT_DIR": str(other / ".git"), "GIT_INDEX_FILE": str(other / ".git" / "index"),
                        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "diff.context", "GIT_CONFIG_VALUE_0": "5",
-                       "GIT_CONFIG_PARAMETERS": "'diff.noprefix'='true'"}
-            for name in ("GIT_CONFIG_GLOBAL", "GIT_DIFF_OPTS", "GIT_DIR", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"):
+                       "GIT_CONFIG_PARAMETERS": "'diff.noprefix'='true'", "GIT_ATTR_SOURCE": tree}
+            for name in ("GIT_CONFIG_GLOBAL", "GIT_DIFF_OPTS", "GIT_DIR", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
+                         "GIT_ATTR_SOURCE"):
                 single = {name: hostile[name]}
                 if name == "GIT_DIR":
                     single["GIT_INDEX_FILE"] = hostile["GIT_INDEX_FILE"]
@@ -518,12 +532,13 @@ class PrepareTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         root = Path(self.directory.name).resolve()
-        self.clean = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        self.clean = git_test_environment()
         self.upstream = root / "upstream"
         self.upstream.mkdir()
         (self.upstream / "file.txt").write_text("".join(f"line {number}\n" for number in range(20)))
+        (self.upstream / "other.txt").write_text("not touched by the patch\n")
         self.git(self.upstream, "init", "--quiet")
-        self.git(self.upstream, "add", "file.txt")
+        self.git(self.upstream, "add", "file.txt", "other.txt")
         self.git(self.upstream, "commit", "--quiet", "--message", "base")
         self.git(self.upstream, "tag", "v1")
         commit = self.git(self.upstream, "rev-parse", "HEAD").strip()
@@ -568,6 +583,76 @@ class PrepareTests(unittest.TestCase):
         with self.assertRaises(probe.ProbeError): probe.prepare()
         self.assertTrue((self.source / "note.txt").exists())
 
+    def test_injected_settings_reach_only_the_fetch(self):
+        injected = {"GIT_CONFIG_PARAMETERS": "'http.proxy'='x'", "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "http.sslCAInfo", "GIT_CONFIG_VALUE_0": "/ca.pem"}
+        with patch.dict(os.environ, {**injected, "GIT_DIR": "/elsewhere", "GIT_WORK_TREE": "/elsewhere"}):
+            local, fetch = probe.git_environment(), probe.git_environment(keep_config=True)
+        for key, value in injected.items():
+            self.assertNotIn(key, local)
+            self.assertEqual(fetch[key], value)
+        for env in (local, fetch):
+            self.assertNotIn("GIT_DIR", env)
+            self.assertNotIn("GIT_WORK_TREE", env)
+            self.assertEqual(env["GIT_NO_REPLACE_OBJECTS"], "1")
+        # A mirror given only through injected settings is honoured by the fetch, and an
+        # injected line-ending conversion still cannot produce CRLF files.
+        self.dependency["repository"] = "https://mirror.invalid/FreeRDP.git"
+        with patch.dict(os.environ, {"GIT_CONFIG_PARAMETERS":
+                                     f"'url.{self.upstream.as_uri()}.insteadOf'='https://mirror.invalid/FreeRDP.git' "
+                                     "'core.autocrlf'='true'"}):
+            probe.prepare()
+        self.assertNotIn(b"\r\n", (self.source / "file.txt").read_bytes())
+        self.assertNotIn(b"\r\n", (self.source / "other.txt").read_bytes())
+
+    def test_index_marks_replacements_and_fsmonitor_cannot_hide_edits(self):
+        probe.prepare()
+        other = self.source / "other.txt"
+        def hidden(setup, undo):
+            other.write_text("unapproved edit\n")
+            setup()
+            with self.assertRaises(probe.ProbeError):
+                probe.prepare()
+            self.assertEqual(other.read_text(), "unapproved edit\n")  # Kept, never discarded.
+            undo()
+            self.git(self.source, "checkout", "--quiet", "--", "other.txt")
+            probe.prepare()
+        for flag in ("assume-unchanged", "skip-worktree"):
+            with self.subTest(index_mark=flag):
+                hidden(lambda: self.git(self.source, "update-index", "--" + flag, "other.txt"),
+                       lambda: self.git(self.source, "update-index", "--no-" + flag, "other.txt"))
+        with self.subTest("replacement object"):
+            def replace():
+                # A commit whose tree already holds the edit stands in for the pinned commit.
+                index = Path(self.directory.name) / "replacement-index"
+                environment = {**self.clean, "GIT_INDEX_FILE": str(index)}
+                run = lambda *arguments: subprocess.run(
+                    ["git", "-C", self.source, "-c", "user.name=test", "-c", "user.email=test@localhost",
+                     *arguments], check=True, capture_output=True, text=True, env=environment).stdout.strip()
+                run("read-tree", "HEAD")
+                run("update-index", "--add", "--cacheinfo",
+                    f"100644,{run('hash-object', '-w', 'other.txt')},other.txt")
+                substitute = run("commit-tree", run("write-tree"), "-m", "substitute")
+                self.git(self.source, "replace", self.dependency["commit"], substitute)
+                self.assertEqual(self.git(self.source, "rev-parse", "HEAD").strip(), self.dependency["commit"])
+            hidden(replace, lambda: self.git(self.source, "replace", "-d", self.dependency["commit"]))
+        with self.subTest("fsmonitor"):
+            monitor = Path(self.directory.name) / "fsmonitor.sh"
+            monitor.write_text("#!/bin/sh\nprintf 'token\\0'\n")  # Protocol 2: "nothing changed".
+            monitor.chmod(0o755)
+            def watch():
+                self.git(self.source, "config", "core.fsmonitor", str(monitor))
+                self.git(self.source, "status", "--porcelain")
+            hidden(watch, lambda: self.git(self.source, "config", "--unset", "core.fsmonitor"))
+        # core.ignoreStat in the user's settings marks every entry at clone time.
+        settings = Path(self.directory.name) / "gitconfig"
+        settings.write_text("[core]\n\tignoreStat = true\n")
+        shutil.rmtree(self.source)
+        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(settings)}):
+            probe.prepare()
+            probe.prepare()
+        self.assertIn("observed\n", (self.source / "file.txt").read_text())
+
     def test_user_apply_and_repository_settings_do_not_change_the_result(self):
         # Trailing whitespace in an added line: apply.whitespace=fix would strip it.
         (self.upstream / "file.txt").write_text("".join(
@@ -598,6 +683,13 @@ class PrepareTests(unittest.TestCase):
         (self.source / ".git" / "info").mkdir(exist_ok=True)
         (self.source / ".git" / "info" / "exclude").write_text(".gitattributes\n")
         (self.source / ".gitattributes").write_text("*.txt -diff\n")
+        with self.assertRaises(probe.ProbeError) as raised:
+            probe.prepare()
+        self.assertIn(".gitattributes", str(raised.exception))
+        # A case-insensitive file system reads another spelling as the same file.
+        (self.source / ".gitattributes").unlink()
+        (self.source / ".git" / "info" / "exclude").write_text(".GitAttributes\n")
+        (self.source / ".GitAttributes").write_text("*.txt -diff\n")
         with self.assertRaises(probe.ProbeError) as raised:
             probe.prepare()
         self.assertIn(".gitattributes", str(raised.exception))

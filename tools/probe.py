@@ -51,7 +51,9 @@ ENV_DROP_NAMES = frozenset({
 GIT_DROP_NAMES = frozenset({
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_ATTR_SOURCE",
-    "GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"})
+    "GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF"})
+GIT_CONFIG_NAMES = frozenset({"GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"})
+GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 CASES = {
     "P01": "Native Wayland: display, move, resize, input, popups",
     "P02": "Existing AND new windows discovered; representative app inventory",
@@ -136,24 +138,46 @@ def exclusive_cache():
         os.close(descriptor)
 
 
-def git_environment() -> dict:
-    # Variables that point git at another repository, index or attribute source, or that inject
-    # settings and diff options. A git hook exports some of them (GIT_DIR, GIT_INDEX_FILE), and
-    # with them `git -C <cache>` would read, compare or patch a different checkout.
-    env = {key: value for key, value in os.environ.items()
-           if key not in GIT_DROP_NAMES and not key.startswith("GIT_CONFIG_KEY_")
-           and not key.startswith("GIT_CONFIG_VALUE_")}
+def git_environment(*, keep_config: bool = False) -> dict:
+    # Variables that point git at another repository, index, object set or attribute source, or
+    # that inject settings and diff options. A git hook exports some of them (GIT_DIR,
+    # GIT_INDEX_FILE), and with them `git -C <cache>` would read, compare or patch a different
+    # checkout. The fetch keeps injected settings, which may carry a mirror, CA or proxy.
+    def kept(key):
+        if key in GIT_CONFIG_NAMES or key.startswith(GIT_CONFIG_PREFIXES):
+            return keep_config
+        return key not in GIT_DROP_NAMES
+    env = {key: value for key, value in os.environ.items() if kept(key)}
     env["GIT_ATTR_NOSYSTEM"] = "1"
+    # A replacement object for the pinned commit would change the tree that HEAD compares with,
+    # while `rev-parse HEAD` still prints the pinned ID.
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     return env
 
 
-def git(*arguments, step: str, capture: bool = False) -> str:
-    return command(["git", *arguments], step=step, capture=capture, env=git_environment())
+# Pinned on every call; command-line settings win over user, repository and injected ones.
+# The first three let the index or a hook answer "unchanged" without reading the files;
+# core.autocrlf=true would check out CRLF files that the LF patch can never match.
+GIT_PINNED = ("-c", "core.fsmonitor=false", "-c", "core.ignoreStat=false", "-c", "core.untrackedCache=false",
+              "-c", "core.autocrlf=false")
+
+
+def git(*arguments, step: str, capture: bool = False, keep_config: bool = False) -> str:
+    return command(["git", *GIT_PINNED, *arguments], step=step, capture=capture,
+                   env=git_environment(keep_config=keep_config))
 
 
 def source_diff() -> str:
     # The text is compared byte for byte with the approved patch, so user and system settings
     # that shape it are pinned. Otherwise a correct checkout is reported as modified.
+    # Entries flagged assume-unchanged or skip-worktree are not read from disk by the diff, so an
+    # edit to them would be invisible. Only plain cached entries ("H") are accepted.
+    flagged = [entry for entry in git("-C", SOURCE, "ls-files", "-v", "-z",
+                                      step="Reading the dependency index", capture=True).split("\0")
+               if entry and not entry.startswith("H ")]
+    if flagged:
+        raise ProbeError("Files in the dependency checkout are marked assume-unchanged or skip-worktree; "
+                         "clear the marks (git update-index) or use a fresh cache")
     # Attributes in the checkout's own info/attributes cannot be switched off from the command
     # line; they can mark a file binary, or name a filter that rewrites what the diff shows.
     location = git("-C", SOURCE, "rev-parse", "--git-path", "info/attributes",
@@ -192,7 +216,7 @@ def prepare() -> None:
         shutil.rmtree(partial, ignore_errors=True)
         SOURCE.parent.mkdir(parents=True, exist_ok=True)
         git("-c", "advice.detachedHead=false", "clone", "--depth", "1", "--branch", dependency["tag"],
-            dependency["repository"], partial, step="Fetching the pinned FreeRDP source")
+            dependency["repository"], partial, step="Fetching the pinned FreeRDP source", keep_config=True)
         os.rename(partial, SOURCE)
     # Without its own repository here, git would answer for the enclosing WayWin checkout.
     top = git("-C", SOURCE, "rev-parse", "--show-toplevel",
@@ -209,7 +233,8 @@ def prepare() -> None:
     if git(*untracked, step="Listing untracked dependency files", capture=True):
         raise ProbeError("Untracked files in dependency source; inspect them first")
     # An ignored attributes file still applies, and could rewrite what the comparison sees.
-    if any(Path(name).name == ".gitattributes" for name in git(
+    # Case-insensitive file systems read .GITATTRIBUTES as .gitattributes.
+    if any(Path(name).name.casefold() == ".gitattributes" for name in git(
             *untracked, "--ignored", step="Listing ignored dependency files", capture=True).split("\0")):
         raise ProbeError("An ignored .gitattributes file is in the dependency source; inspect it first")
     changes = source_diff()

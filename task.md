@@ -52,7 +52,7 @@ Windows 셸 메뉴의 실제 실행·RAIL 별도 전송, GNOME 혼합 배율·ho
 | 입력 검증 | 모니터 ID 상한 65535, 숫자형 호스트 이름 거부, `--user`의 `\` 거부, IPv6 zone 형식 제한 | 단위 테스트 |
 | 실행 기록 | `exit.json`에 관측한 SDL 드라이버와 종료 사유(`ended`). 목록 밖 드라이버는 `unknown`으로 기록하고 중단 | 데스크톱 실행은 관측 이벤트가 없어 `null`. 패치 변경이 필요해 보류(아래 「실환경 없이 진행한 도구 보완」에서 해결) |
 | 세션 수명 | SIGHUP 정리(무시 상태면 유지), 세션이 남긴 프로세스 그룹 종료, 파이프를 잡은 프로세스가 있어도 종료 대기에서 벗어남 | 합성 프로세스로 테스트. 도구가 SIGKILL되면 세션은 남음 |
-| `prepare`/`build` | 실패 단계와 종료 코드 표시, Ctrl-C는 130, 임시 경로 clone 후 이동, 불완전한 캐시 거부, 잠금, `--jobs` 기본값 CPU 수 | 임시 upstream 저장소로 `prepare` 테스트 추가. `build`의 CMake 단계는 여전히 자동 테스트 없음 |
+| `prepare`/`build` | 실패 단계와 종료 코드 표시, Ctrl-C는 130, 임시 경로 clone 후 이동, 불완전한 캐시 거부, 잠금, `--jobs` 기본값 CPU 수 | 임시 upstream 저장소로 `prepare` 테스트 추가. `build`의 CMake 단계는 여전히 자동 테스트 없음(아래 「실환경 없이 진행한 도구 보완」에서 가짜 `cmake` 테스트 추가. 실제 CMake 동작은 대신하지 못함) |
 | 플랫폼 간 바이트 | 패치 줄바꿈 변환 금지, 파일 입출력 UTF-8 | Windows checkout 미실행 |
 | 상속 환경 | `FREERDP_ASKPASS`·프록시·로더·OpenSSL 변수 제거, `/proxy:ignore` | 차단 목록 방식. 허용 목록은 입력기 동작을 확인할 수 없어 채택하지 않음 |
 | 빌드 명세 | schema 2. 빌드 디렉터리의 모든 공유 라이브러리 해시와 버전 링크를 기록하고 실행 전 대조 | macOS 실제 빌드로 확인. Linux 파일 이름은 미관측. 명세는 서명되지 않음 |
@@ -78,6 +78,7 @@ Windows 셸 메뉴의 실제 실행·RAIL 별도 전송, GNOME 혼합 배율·ho
 | 데스크톱 실행의 드라이버 미관측 | 드라이버 기록을 RAIL 초기화에서 `main()`의 `SDL_Init` 직후로 옮김. 데스크톱·RAIL 모두 접속 전에 한 번 기록. 패치가 두 파일이 되어 락 해시 갱신 | macOS 재빌드 통과. 닫힌 루프백 포트 접속에서 두 모드 모두 `driver=offscreen` 한 줄, `WAYWIN_PROBE_EVENTS`가 `1`이 아니면 출력 없음. 패치 해시가 바뀌어 **기존 빌드 명세는 모두 무효**, Ubuntu에서도 재빌드 필요. Wayland 실관측은 미실행 |
 | `prepare`가 호출 환경의 Git 상태에 영향받음 | 저장소 위치·설정 주입 변수(`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE`, `GIT_CONFIG_PARAMETERS`/`COUNT`, `GIT_ATTR_SOURCE` 등)를 모든 Git 호출에서 제거. 비교의 파일 순서(`diff.orderFile`)를 고정하고 `apply`의 공백 수정을 끔. 캐시 자체의 `info/attributes`에 내용이 있거나 무시 목록에 가려진 `.gitattributes`가 있으면 중단. 미추적 파일 검사에 사용자 전역 무시 파일을 쓰지 않음 | Git hook 안에서 실행하면 `git -C <캐시>`가 다른 저장소를 비교·패치할 수 있었다. 패치가 두 파일이 되면서 파일 순서 설정도 비교에 영향을 주게 됨. 새 테스트는 수정 전 코드에서 실패. 캐시 로컬 설정의 `filter` 정의는 attributes가 있어야 동작하므로 attributes 경로를 막는 것으로 대신함 |
 | `build`의 CMake 단계 자동 테스트 없음 | PATH에 둔 가짜 `cmake`로 configure·build 인자, 단계별 실패 문구, 실패 시 이전 명세 삭제, 실행파일 누락·버전 불일치, `cmake` 미설치, Linux의 네이티브 Wayland 보조 경로 요구, 의존성 버전 추출, 명세 권한·재빌드·`verified_binary` 통과를 검사 | 기존 코드에서 결함은 나오지 않음. 실제 CMake·컴파일러 동작은 이 테스트로 대신할 수 없으며, 위 macOS 실제 빌드만 확인함 |
+| 독립 검토에서 확인된 비교 우회 (위 세 커밋 대상) | 모든 Git 호출에 `core.fsmonitor`·`core.ignoreStat`·`core.untrackedCache`·`core.autocrlf`를 끈 값으로 고정하고 `GIT_NO_REPLACE_OBJECTS=1`. 색인에 assume-unchanged/skip-worktree 표시가 있으면 중단. 무시된 `.gitattributes`는 대소문자 무관하게 찾음. 설정 주입 변수는 내려받기(clone)에만 넘겨 미러·CA·프록시 설정을 유지. 테스트의 자체 Git 호출도 hook 변수를 제거한 환경에서 실행 | 네 관점 검토 후 각 지적을 재현해 반박 시도: 8건 모두 확인. 이 중 색인 표시·대체 객체·fsmonitor는 **이전부터 있던** 결함으로, 승인된 패치만 보이게 하면서 다른 파일을 바꾼 소스를 통과시키거나(캐시 쓰기 권한 필요), 사용자 설정 `core.ignoreStat=true`에서는 `prepare`가 영구히 실패했다. 새 테스트는 수정 전 코드에서 실패. 주입된 설정 중 고정 옵션이 이미 덮어쓰는 것은 출력 차이로 검증할 수 없어 변수 제거 자체를 단위 테스트함 |
 
 ## 진행
 
