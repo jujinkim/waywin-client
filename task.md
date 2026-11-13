@@ -77,6 +77,7 @@ Windows 셸 메뉴의 실제 실행·RAIL 별도 전송, GNOME 혼합 배율·ho
 |---|---|---|
 | 데스크톱 실행의 드라이버 미관측 | 드라이버 기록을 RAIL 초기화에서 `main()`의 `SDL_Init` 직후로 옮김. 데스크톱·RAIL 모두 접속 전에 한 번 기록. 패치가 두 파일이 되어 락 해시 갱신 | macOS 재빌드 통과. 닫힌 루프백 포트 접속에서 두 모드 모두 `driver=offscreen` 한 줄, `WAYWIN_PROBE_EVENTS`가 `1`이 아니면 출력 없음. 패치 해시가 바뀌어 **기존 빌드 명세는 모두 무효**, Ubuntu에서도 재빌드 필요. Wayland 실관측은 미실행 |
 | `prepare`가 호출 환경의 Git 상태에 영향받음 | 저장소 위치·설정 주입 변수(`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE`, `GIT_CONFIG_PARAMETERS`/`COUNT`, `GIT_ATTR_SOURCE` 등)를 모든 Git 호출에서 제거. 비교의 파일 순서(`diff.orderFile`)를 고정하고 `apply`의 공백 수정을 끔. 캐시 자체의 `info/attributes`에 내용이 있거나 무시 목록에 가려진 `.gitattributes`가 있으면 중단. 미추적 파일 검사에 사용자 전역 무시 파일을 쓰지 않음 | Git hook 안에서 실행하면 `git -C <캐시>`가 다른 저장소를 비교·패치할 수 있었다. 패치가 두 파일이 되면서 파일 순서 설정도 비교에 영향을 주게 됨. 새 테스트는 수정 전 코드에서 실패. 캐시 로컬 설정의 `filter` 정의는 attributes가 있어야 동작하므로 attributes 경로를 막는 것으로 대신함 |
+| `build`의 CMake 단계 자동 테스트 없음 | PATH에 둔 가짜 `cmake`로 configure·build 인자, 단계별 실패 문구, 실패 시 이전 명세 삭제, 실행파일 누락·버전 불일치, `cmake` 미설치, Linux의 네이티브 Wayland 보조 경로 요구, 의존성 버전 추출, 명세 권한·재빌드·`verified_binary` 통과를 검사 | 기존 코드에서 결함은 나오지 않음. 실제 CMake·컴파일러 동작은 이 테스트로 대신할 수 없으며, 위 macOS 실제 빌드만 확인함 |
 
 ## 진행
 

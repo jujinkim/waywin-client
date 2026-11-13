@@ -657,6 +657,124 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(victim.read_text(), "important")
 
 
+FAKE_CMAKE = """\
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\\n")
+def status(name):
+    code = int(os.environ.get(name, "0"))
+    if code:
+        sys.exit(code)
+if "-S" in args:
+    status("FAKE_CONFIGURE_STATUS")
+    build = Path(args[args.index("-B") + 1])
+    deps = Path(os.environ["FAKE_DEPS"])
+    (build / "CMakeCache.txt").write_text(
+        f"SDL3_DIR:PATH={deps / 'sdl3'}\\nOPENSSL_INCLUDE_DIR:PATH={deps / 'include'}\\n"
+        "//comment: not an entry\\n")
+    flags = "-DWITH_SDL_WAYLAND_NATIVE" if os.environ.get("FAKE_NATIVE") == "1" else ""
+    (build / "compile_commands.json").write_text(json.dumps([{"command": "c++ " + flags}]))
+elif "--build" in args:
+    status("FAKE_BUILD_STATUS")
+    build = Path(args[args.index("--build") + 1])
+    library = build / "libfreerdp" / "libfreerdp3.so.3.33.1"
+    library.parent.mkdir(exist_ok=True)
+    library.write_bytes(b"synthetic library")
+    link = library.with_name("libfreerdp3.so.3")
+    if not link.is_symlink():
+        link.symlink_to(library.name)
+    if os.environ.get("FAKE_NO_BINARY") != "1":
+        client = build / "client" / "SDL" / "SDL3" / "sdl3-freerdp"
+        client.parent.mkdir(parents=True, exist_ok=True)
+        client.write_text("#!/bin/sh\\necho \\"$FAKE_VERSION\\"\\n")
+        client.chmod(0o755)
+"""
+
+
+@unittest.skipUnless(os.name == "posix", "the fake toolchain uses POSIX scripts and links")
+class BuildTests(unittest.TestCase):
+    """build() through a fake cmake on PATH: configure, build, version and manifest steps."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        tools = self.root / "bin"
+        tools.mkdir()
+        cmake = tools / "cmake"
+        cmake.write_text(f"#!{sys.executable}\n" + FAKE_CMAKE)
+        cmake.chmod(0o755)
+        deps = self.root / "deps"
+        (deps / "sdl3").mkdir(parents=True)
+        (deps / "sdl3" / "SDL3ConfigVersion.cmake").write_text('set(PACKAGE_VERSION "3.4.18")\n')
+        (deps / "include" / "openssl").mkdir(parents=True)
+        (deps / "include" / "openssl" / "opensslv.h").write_text(
+            '# define OPENSSL_VERSION_TEXT "OpenSSL 4.0.3 1 Oct 2026"\n')
+        self.build = self.root / "build"
+        self.log = self.root / "calls.jsonl"
+        self.manifest = self.build / "build-manifest.json"
+        self.environment = {"PATH": f"{tools}{os.pathsep}{os.environ.get('PATH', '')}",
+                            "FAKE_LOG": str(self.log), "FAKE_DEPS": str(deps), "FAKE_NATIVE": "1",
+                            "FAKE_VERSION": "This is FreeRDP version 3.33.1 (3.33.1)"}
+        for patcher in (patch.object(probe, "BUILD", self.build), patch.object(probe, "prepare"),
+                        patch.dict(os.environ, self.environment)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def calls(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def failed_build(self, message, **environment):
+        # A manifest from an earlier build must not survive a failed one.
+        self.build.mkdir(exist_ok=True)
+        self.manifest.write_text("{}")
+        with patch.dict(os.environ, environment), self.assertRaises(probe.ProbeError) as raised:
+            probe.build(3)
+        self.assertIn(message, str(raised.exception))
+        self.assertFalse(self.manifest.exists())
+        return str(raised.exception)
+
+    def test_successful_build_writes_a_manifest_that_verifies(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            probe.build(3)
+        self.assertIn("No RDP compatibility test was performed", output.getvalue())
+        configure, compile_ = self.calls()
+        self.assertEqual(configure, ["-S", str(probe.SOURCE), "-B", str(self.build), "-G", "Ninja",
+                                     "-C", str(probe.PROFILE), "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"])
+        self.assertEqual(compile_, ["--build", str(self.build), "--target", "sdl3-freerdp", "--parallel", "3"])
+        self.assertEqual(stat.S_IMODE(self.manifest.stat().st_mode), 0o600)
+        binary, manifest = probe.verified_binary(self.manifest)
+        self.assertEqual(binary, self.build / "client/SDL/SDL3/sdl3-freerdp")
+        self.assertEqual(manifest["dependency_versions"], {"SDL3": "3.4.18", "OpenSSL": "OpenSSL 4.0.3 1 Oct 2026"})
+        self.assertEqual(manifest["libraries"]["libfreerdp/libfreerdp3.so.3"], "-> libfreerdp/libfreerdp3.so.3.33.1")
+        self.assertTrue(manifest["native_wayland_helpers"])
+        self.assertIn("3.33.1", manifest["version"])
+        # A second build replaces the manifest instead of failing on the existing file.
+        with patch("sys.stdout", new_callable=io.StringIO):
+            probe.build(1)
+        self.assertEqual(probe.verified_binary(self.manifest)[0], binary)
+
+    def test_each_failing_step_is_named_and_leaves_no_manifest(self):
+        with patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(self.failed_build("CMake configure failed with exit status 3",
+                                               FAKE_CONFIGURE_STATUS="3"),
+                             "CMake configure failed with exit status 3; see its error output above")
+            self.assertEqual(len(self.calls()), 1)
+            self.failed_build("Building sdl3-freerdp failed with exit status 4", FAKE_BUILD_STATUS="4")
+        self.failed_build("SDL3 executable missing", FAKE_NO_BINARY="1")
+        self.failed_build("Unexpected FreeRDP version", FAKE_VERSION="This is FreeRDP version 3.34.0")
+        self.failed_build("not installed or not on PATH", PATH=str(self.root / "empty"))
+
+    def test_linux_build_requires_native_wayland_helpers(self):
+        with patch.object(probe.platform, "system", return_value="Linux"):
+            self.failed_build("SDL native Wayland helpers missing", FAKE_NATIVE="0")
+            with patch("sys.stdout", new_callable=io.StringIO):
+                probe.build(2)
+        self.assertEqual(json.loads(self.manifest.read_text())["system"], "Linux")
+
+
 class CommandLineTests(unittest.TestCase):
     def cli(self, *arguments):
         return subprocess.run([sys.executable, ROOT / "tools/probe.py", *arguments], capture_output=True, text=True)
