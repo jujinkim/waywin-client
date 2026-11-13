@@ -1,4 +1,9 @@
 add_executable(waywin-windows-probe WIN32 main.cpp probe.rc)
+# Track external resource inputs for generators without RC dependency scanning.
+set_property(SOURCE probe.rc APPEND PROPERTY OBJECT_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/resource.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/probe.manifest"
+  "${PROJECT_SOURCE_DIR}/assets/icons/waywin.ico")
 target_compile_features(waywin-windows-probe PRIVATE cxx_std_17)
 target_compile_definitions(waywin-windows-probe PRIVATE
   UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)

@@ -8,6 +8,7 @@
 #include <initializer_list>
 #include <string>
 #include <vector>
+#include "resource.h"
 
 namespace {
 constexpr wchar_t WindowClass[] = L"WayWinProbeWindow";
@@ -380,14 +381,19 @@ int WINAPI wWinMain(HINSTANCE appInstance, HINSTANCE, PWSTR, int show) {
         !ProcessIdToSessionId(GetCurrentProcessId(), &sessionId)) return 1;
     identity = buffer;
     taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-    WNDCLASSW cls{};
+    WNDCLASSEXW cls{};
+    cls.cbSize = sizeof(cls);
     cls.lpfnWndProc = windowProc;
     cls.hInstance = instance;
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    cls.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    // Keep separate process-lifetime handles: LR_SHARED caches by name, ignoring size.
+    cls.hIcon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_WAYWIN), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
+    cls.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_WAYWIN), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
     cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     cls.lpszClassName = WindowClass;
-    if (!RegisterClassW(&cls)) return 1;
+    if (!cls.hIcon || !cls.hIconSm || !RegisterClassExW(&cls)) return 1;
     mainWindow = CreateWindowExW(WS_EX_CONTROLPARENT, WindowClass, L"WayWin feasibility fixture",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 800, 660,
         nullptr, nullptr, instance, nullptr);

@@ -1,2 +1,5 @@
 #include <windows.h>
+#include "resource.h"
+
 1 RT_MANIFEST "probe.manifest"
+IDI_WAYWIN ICON "../../assets/icons/waywin.ico"
