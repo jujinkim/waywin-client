@@ -80,6 +80,8 @@ Windows 셸 메뉴의 실제 실행·RAIL 별도 전송, GNOME 혼합 배율·ho
 | `build`의 CMake 단계 자동 테스트 없음 | PATH에 둔 가짜 `cmake`로 configure·build 인자, 단계별 실패 문구, 실패 시 이전 명세 삭제, 실행파일 누락·버전 불일치, `cmake` 미설치, Linux의 네이티브 Wayland 보조 경로 요구, 의존성 버전 추출, 명세 권한·재빌드·`verified_binary` 통과를 검사 | 기존 코드에서 결함은 나오지 않음. 실제 CMake·컴파일러 동작은 이 테스트로 대신할 수 없으며, 위 macOS 실제 빌드만 확인함 |
 | 독립 검토에서 확인된 비교 우회 (위 세 커밋 대상) | 모든 Git 호출에 `core.fsmonitor`·`core.ignoreStat`·`core.untrackedCache`·`core.autocrlf`를 끈 값으로 고정하고 `GIT_NO_REPLACE_OBJECTS=1`. 색인에 assume-unchanged/skip-worktree 표시가 있으면 중단. 무시된 `.gitattributes`는 대소문자 무관하게 찾음. 설정 주입 변수는 내려받기(clone)에만 넘겨 미러·CA·프록시 설정을 유지. 테스트의 자체 Git 호출도 hook 변수를 제거한 환경에서 실행 | 네 관점 검토 후 각 지적을 재현해 반박 시도: 8건 모두 확인. 이 중 색인 표시·대체 객체·fsmonitor는 **이전부터 있던** 결함으로, 승인된 패치만 보이게 하면서 다른 파일을 바꾼 소스를 통과시키거나(캐시 쓰기 권한 필요), 사용자 설정 `core.ignoreStat=true`에서는 `prepare`가 영구히 실패했다. 새 테스트는 수정 전 코드에서 실패. 주입된 설정 중 고정 옵션이 이미 덮어쓰는 것은 출력 차이로 검증할 수 없어 변수 제거 자체를 단위 테스트함 |
 
+재검증: **자동 테스트 60개 통과**(Python 3.12), CTest 통과, 실제 캐시로 `prepare` 통과, macOS 재빌드와 새 명세 검증 통과. 독립 검토는 워크플로로 네 관점(패치·Git 환경·테스트·문서)을 나눠 수행하고 지적마다 재현을 시도했다. 이 단위 이후의 다음 작업은 여전히 실제 Ubuntu 26.04에서의 동일 프로필 빌드와 Windows 11 RAIL 경로·P01–P03 조사이다. 사용자 요청에 따라 `main`에 커밋하고 `origin/main`에 푸시한다.
+
 ## 진행
 
 - [x] 빈 Git 저장소·PC 지침·필수 웹 지침(v1 revision 8) 재확인.
