@@ -23,6 +23,26 @@
 
 Windows 셸 메뉴의 실제 실행·RAIL 별도 전송, GNOME 혼합 배율·hotplug, Windows 원격 세션별 화면 수 등은 **모두 미실행**이다. 호스트 물리 모니터 수에 따라 RDP 화면 수가 그대로 결정된다고 보지 않으며 실제 협상 결과를 대조해야 한다. FreeRDP 관측 패치·고정 커밋·프로필은 이번 재검토에서 변경하지 않았다. 추가 스킬·서브에이전트·computer-use는 사용하지 않았다.
 
+## 검토 후 수정과 재연결 설계 (2026-11-13)
+
+구현 완성도·RDP 클라이언트 보안·성능·안정성을 읽기 전용으로 검토했고, 사용자가 요청한 다섯 항목을 `fix/review-findings` 브랜치에서 항목별로 커밋했다. 이후 독립 검증에서 나온 보완 두 건도 반영했다. 푸시는 하지 않았다.
+
+| 항목 | 조치 | 확인한 것 / 남은 것 |
+|---|---|---|
+| 표준 RDP 보안으로 내려가면 인증서 확인 없이 비밀번호를 받음 | 고정 인자에 `/sec:rdp:off` 추가, 테스트로 고정 | 고정 소스에서 협상 실패 경로 확인. NLA 전용(`/sec:nla`)은 NTLM의 Ubuntu 동작이 미확인이라 채택하지 않음. 실접속 미실행 |
+| Ubuntu에서 문서대로 빌드하면 configure 실패 가능 | 프로필에 `WITH_FUSE OFF`, 패키지 목록에 `libicu-dev` | macOS configure만 통과. **Ubuntu 빌드 미실행.** 프로필 해시가 바뀌어 기존 빌드 명세는 무효, 재빌드 필요 |
+| MSVC 빌드의 manifest 중복 | MSVC에서 `/MANIFEST:NO` | MinGW 교차 빌드 통과. **MSVC 빌드 미실행** |
+| 정리 중 두 번째 Ctrl-C가 강제 종료와 `exit.json`을 건너뜀 | 첫 신호만 중단으로 처리, 정리 재시도, SIGKILL 후 대기 5초 제한, 처리기 복원 | 수정 전 실패하는 테스트 추가. SIGHUP·launcher 강제 종료 시 세션 프로세스가 남는 문제는 미해결 |
+| 패치 비교가 사용자 git 설정에 의존 | diff 형식을 명령행에서 고정, `GIT_DIFF_OPTS`·사용자 attributes 제외 | 적대적 설정에서 실제 `prepare` 통과. 캐시 저장소 내부의 `.git/info/attributes`는 여전히 영향 |
+
+재검증: **자동 테스트 32개 통과**(Python 3.12), CTest 통과. 이 PC의 기본 `python3`는 3.9라 `python3.12`로 실행해야 한다.
+
+검토에서 확인했으나 이번에 고치지 않은 것: FreeRDP 설정·인증서 저장소 공유, 상속되는 `FREERDP_ASKPASS`·프록시·`LD_LIBRARY_PATH`, 공유 라이브러리가 빠진 실행파일 해시, 관측한 SDL 드라이버 미기록, RAIL 재접속 시 `--app` 재실행, 중단된 clone의 복구, 동시 빌드 잠금, 오류 원인 미표시, `prepare`/`build` 테스트 공백.
+
+재연결 전략과 UX를 `docs/plan.md`에 설계로 추가했다(최대 5회 지수 지연, 해당 호스트 창을 어둡게 하고 중앙에 상태 표시). 1단계 설계이며 미구현·미검증이다.
+
+커밋 작성자는 Git 설정이 없어 `Claude Code <noreply@anthropic.com>`를 명시했다.
+
 ## 진행
 
 - [x] 빈 Git 저장소·PC 지침·필수 웹 지침(v1 revision 8) 재확인.
