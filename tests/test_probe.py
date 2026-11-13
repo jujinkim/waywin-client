@@ -43,6 +43,8 @@ class EndpointTests(unittest.TestCase):
         self.assertIn("/d:ACME", argv)
         self.assertIn("-clipboard", argv)
         self.assertIn("-auto-reconnect", argv)
+        # Only the protocol without certificate validation is switched off; TLS and NLA stay available.
+        self.assertEqual([x for x in argv if x.startswith("/sec:")], ["/sec:rdp:off"])
         self.assertFalse(any(x.startswith(("/p:", "/cert:", "/drive:", "/microphone")) for x in argv))
 
     def test_rail_single_program_and_no_options_injection(self):

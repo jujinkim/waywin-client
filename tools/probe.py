@@ -258,7 +258,8 @@ def rdp_args(binary: Path, server: str, user: str, domain: str, label: str,
     args = [str(binary), f"/v:{endpoint(server)}", f"/u:{text_option(user, 'user')}",
             f"/t:[{text_option(label, 'label')}] WayWin probe",
             "-clipboard", "/audio-mode:2", "-auto-reconnect", "/timeout:9000",
-            "/log-level:ERROR"]
+            # Standard RDP Security has no certificate check; a server could select it to skip validation.
+            "/sec:rdp:off", "/log-level:ERROR"]
     if display["mode"] == "multimon":
         args.append("/multimon")
         if display["monitor_ids"]:
