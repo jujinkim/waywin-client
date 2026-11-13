@@ -539,6 +539,90 @@ def stop_child(child: subprocess.Popen, timeout: float = 3.0) -> None:
         pass
 
 
+# Runs in its own session so that signals to the tool's terminal or process group do not reach it.
+# It ends the recorded session group when the tool's end of the pipe closes without "done", which
+# happens when the tool itself is killed (SIGKILL) and cannot clean up.
+GUARD_CODE = r"""
+import os, signal, sys, time
+for number in (signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGTSTP):
+    signal.signal(number, signal.SIG_IGN)
+os.write(1, b"r")  # Ready: the tool starts no session before this arrives.
+os.close(1)
+data = b""
+while True:
+    chunk = os.read(0, 64)
+    if not chunk:
+        break
+    data += chunk
+    if b"done\n" in data or len(data) > 64:
+        sys.exit(0)
+try:
+    group = int(data.split(b"\n")[0])
+except ValueError:
+    sys.exit(0)
+if group <= 1:
+    sys.exit(0)
+def signal_group(number):
+    try:
+        os.killpg(group, number)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+if signal_group(signal.SIGTERM):
+    deadline = time.monotonic() + GRACE
+    while time.monotonic() < deadline and signal_group(0):
+        time.sleep(0.05)
+    signal_group(signal.SIGKILL)
+"""
+
+
+def start_guard(grace: float = 3.0, timeout: float = 10.0) -> subprocess.Popen:
+    # The guard is this same interpreter, so it gets the tool's own environment: some builds only
+    # start with their loader path set. -I keeps PYTHON* variables and the user site out.
+    try:
+        guard = subprocess.Popen([sys.executable, "-I", "-c", f"GRACE = {float(grace)!r}\n" + GUARD_CODE],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+    except OSError:
+        raise ProbeError("Could not start the session guard") from None
+    # A guard that cannot start would otherwise go unnoticed until the tool is killed.
+    ready = b""
+    try:
+        if select.select([guard.stdout], [], [], timeout)[0]:
+            ready = os.read(guard.stdout.fileno(), 1)
+    finally:
+        guard.stdout.close()
+    if ready != b"r":
+        guard.kill()
+        guard.wait()
+        with contextlib.suppress(OSError):
+            guard.stdin.close()
+        raise ProbeError("The session guard did not start; no session was started")
+    return guard
+
+
+def guard_message(guard: subprocess.Popen, message: bytes) -> bool:
+    try:
+        guard.stdin.write(message)
+        guard.stdin.flush()
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def release_guard(guard: subprocess.Popen) -> None:
+    # Only once the session group is gone: "done" tells the guard that nothing is left to end.
+    guard_message(guard, b"done\n")
+    with contextlib.suppress(OSError, ValueError):
+        guard.stdin.close()
+    try:
+        guard.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        guard.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            guard.wait(timeout=2.0)
+
+
 def reap_group_after_exit(child: subprocess.Popen, released: threading.Event, finished: threading.Event) -> None:
     # The event loop ends on stderr EOF. A process the session started can hold that pipe open
     # after the session itself has exited. Members of its process group are ended after a grace
@@ -657,12 +741,18 @@ def run(args) -> int:
         handled.append(signal.SIGHUP)
     previous = {number: signal.signal(number, interrupted) for number in handled}
     released, finished = threading.Event(), threading.Event()
+    guard = None
     try:
         fd = os.open(directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as output:
+            guard = start_guard()
             child = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                      start_new_session=True)
+            # The child leads its own process group. Until this write the guard knows nothing to
+            # end, so a SIGKILL in the instant between fork and here still leaves the session.
+            if not guard_message(guard, f"{child.pid}\n".encode("ascii")) or guard.poll() is not None:
+                raise ProbeError("The session guard stopped; the session was not left running")
             print(f"Session process: {child.pid}", flush=True)
             threading.Thread(target=reap_group_after_exit, args=(child, released, finished),
                              daemon=True).start()
@@ -697,6 +787,9 @@ def run(args) -> int:
                         stop_child(child)
                         if child.stderr:
                             child.stderr.close()
+                    if guard:
+                        release_guard(guard)
+                        guard = None
                     private_json(directory / "exit.json", {
                         "ended": ended, "exit_code": exit_code, "sdl_driver_observed": driver,
                         "events_seen": count, "events_truncated": count > EVENT_LIMIT,

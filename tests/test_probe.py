@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import contextlib
 import importlib.util
 import io
 import json
@@ -22,6 +23,14 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("probe", ROOT / "tools/probe.py")
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 def git_test_environment():
@@ -905,11 +914,12 @@ class LaunchTests(unittest.TestCase):
             args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
                              label="host-a", mode="rail", app="||probe", output=root / "runs",
                              display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
-            children = []
+            children, guards = [], []
             original_popen = subprocess.Popen
             def spawn(*argv, **kwargs):
                 child = original_popen(*argv, **kwargs)
-                children.append(child)
+                # The session guard is started with this interpreter; sessions are the scripts.
+                (guards if argv[0][0] == sys.executable else children).append(child)
                 return child
             with patch.object(probe, "doctor", return_value={"target_ready": True}), \
                  patch.object(probe, "verified_binary", return_value=(executable,
@@ -917,8 +927,9 @@ class LaunchTests(unittest.TestCase):
                  patch.object(probe.subprocess, "Popen", side_effect=spawn), \
                  patch("sys.stdout", new_callable=io.StringIO):
                 with self.assertRaises(probe.ProbeError): probe.run(args)
-            self.assertEqual(len(children), 1)
+            self.assertEqual((len(children), len(guards)), (1, 1))
             self.assertIsNotNone(children[0].poll())
+            self.assertEqual(guards[0].poll(), 0)  # Released, not left waiting.
             run = next(args.output.iterdir())
             record = json.loads((run / "exit.json").read_text())
             self.assertEqual((record["ended"], record["exit_code"], record["sdl_driver_observed"]),
@@ -937,11 +948,12 @@ class LaunchTests(unittest.TestCase):
             args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
                              label="host-a", mode="rail", app="||probe", output=root / "runs",
                              display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
-            children = []
+            children, guards = [], []
             original_popen, original_stop = subprocess.Popen, probe.stop_child
             def spawn(*argv, **kwargs):
                 child = original_popen(*argv, **kwargs)
-                children.append(child)
+                # The session guard is started with this interpreter; sessions are the scripts.
+                (guards if argv[0][0] == sys.executable else children).append(child)
                 return child
             cleaning = threading.Event()
             def stop(child):
@@ -1036,11 +1048,12 @@ class LaunchTests(unittest.TestCase):
             args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
                              label="host-a", mode="rail", app="||probe", output=root / "runs",
                              display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
-            children = []
+            children, guards = [], []
             original_popen = subprocess.Popen
             def spawn(*argv, **kwargs):
                 child = original_popen(*argv, **kwargs)
-                children.append(child)
+                # The session guard is started with this interpreter; sessions are the scripts.
+                (guards if argv[0][0] == sys.executable else children).append(child)
                 return child
             def hang_up():
                 deadline = time.monotonic() + 10
@@ -1167,6 +1180,148 @@ class LaunchTests(unittest.TestCase):
                         os.kill(other, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    def test_killed_tool_does_not_leave_the_session_running(self):
+        # SIGKILL cannot be handled, so the tool runs in its own process here and is really killed.
+        # "cleanup": killed while stop_child waits for a session that ignores SIGTERM, the order
+        # in which the guard must still hold (it is released only after the group is gone).
+        for when, ignores_term in (("running", False), ("running", True), ("cleanup", True)):
+            with self.subTest(killed=when, session_ignores_sigterm=ignores_term), \
+                 tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                executable = root / "session"
+                executable.write_text(f"#!{sys.executable}\nimport os, signal, subprocess, sys, time\n" +
+                    ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignores_term else "") +
+                    # A process the session started stays in its group, like a helper would.
+                    "member = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                    f"open({str(root / 'pids.tmp')!r}, 'w').write(f'{{os.getpid()}} {{member.pid}}')\n"
+                    f"os.rename({str(root / 'pids.tmp')!r}, {str(root / 'pids')!r})\n"
+                    "print('WAYWIN_PROBE_V1 driver=wayland', file=sys.stderr, flush=True)\n"
+                    "time.sleep(60)\n")
+                executable.chmod(0o700)
+                harness = root / "harness.py"
+                harness.write_text(
+                    "import importlib.util, sys\nfrom argparse import Namespace\nfrom pathlib import Path\n"
+                    "from unittest.mock import patch\n"
+                    f"spec = importlib.util.spec_from_file_location('probe', {str(ROOT / 'tools/probe.py')!r})\n"
+                    "probe = importlib.util.module_from_spec(spec); spec.loader.exec_module(probe)\n"
+                    "original = probe.stop_child\n"
+                    "def stop(child, timeout=3.0):\n"
+                    f"    open({str(root / 'cleaning')!r}, 'w').close()\n"
+                    "    original(child, timeout)\n"
+                    "probe.stop_child = stop\n"
+                    f"args = Namespace(manifest=Path('m'), server='example.test', user='alice', domain='',\n"
+                    f"    label='host-a', mode='rail', app='||probe', output=Path({str(root / 'runs')!r}),\n"
+                    "    display_mode='auto', monitors=None, size=None, dynamic_resolution=False)\n"
+                    "with patch.object(probe, 'doctor', return_value={'target_ready': True}), \\\n"
+                    f"     patch.object(probe, 'verified_binary', return_value=(Path({str(executable)!r}),\n"
+                    "         {'system': 'Linux', 'native_wayland_helpers': True})):\n"
+                    "    probe.run(args)\n")
+                tool = subprocess.Popen([sys.executable, harness], stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                pids = []
+                try:
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline and not any(
+                            path.stat().st_size for path in root.glob("runs/*/events.jsonl")):
+                        time.sleep(0.02)
+                    pids = [int(value) for value in (root / "pids").read_text().split()]
+                    if when == "cleanup":
+                        tool.send_signal(signal.SIGINT)
+                        deadline = time.monotonic() + 10
+                        while time.monotonic() < deadline and not (root / "cleaning").exists():
+                            time.sleep(0.02)
+                        self.assertTrue((root / "cleaning").exists())
+                        time.sleep(0.5)  # Inside the 3 s grace for the SIGTERM it ignores.
+                        self.assertTrue(all(alive(pid) for pid in pids))
+                    tool.kill()
+                    tool.wait()
+                    deadline = time.monotonic() + 10
+                    remaining = pids
+                    while remaining and time.monotonic() < deadline:
+                        remaining = [pid for pid in remaining if alive(pid)]
+                        time.sleep(0.05)
+                    self.assertEqual(remaining, [], "the session group outlived the killed tool")
+                    # No exit record: the tool never got to write one.
+                    self.assertEqual(list(root.glob("runs/*/exit.json")), [])
+                finally:
+                    tool.kill()
+                    tool.wait()
+                    for pid in pids:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, signal.SIGKILL)
+
+    def test_guard_only_acts_on_a_lost_tool(self):
+        def group():
+            member = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                      start_new_session=True)
+            self.addCleanup(lambda: (member.kill(), member.wait()))
+            return member
+        # Released after cleanup: the guard exits and leaves the (here still running) group alone.
+        member, guard = group(), probe.start_guard(grace=0.2)
+        self.assertTrue(probe.guard_message(guard, f"{member.pid}\n".encode()))
+        probe.release_guard(guard)
+        self.assertEqual(guard.returncode, 0)
+        self.assertIsNone(member.poll())
+        # Tool lost: the pipe closes without "done" and the group is ended.
+        member, guard = group(), probe.start_guard(grace=0.2)
+        probe.guard_message(guard, f"{member.pid}\n".encode())
+        guard.stdin.close()
+        self.assertEqual(guard.wait(timeout=10), 0)
+        self.assertEqual(member.wait(timeout=10), -signal.SIGTERM)
+        # SIGTERM comes first and the group gets the grace period to finish on its own ...
+        def handling(code):
+            member = subprocess.Popen([sys.executable, "-c",
+                "import signal, sys, time\n"
+                + (f"signal.signal(signal.SIGTERM, lambda *a: (time.sleep(0.3), sys.exit({code})))\n"
+                   if code else "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n")
+                + "print('ready', flush=True)\ntime.sleep(60)\n"],
+                stdout=subprocess.PIPE, start_new_session=True)
+            self.addCleanup(lambda: (member.kill(), member.wait(), member.stdout.close()))
+            self.assertEqual(member.stdout.readline(), b"ready\n")
+            return member
+        member, guard = handling(3), probe.start_guard(grace=2.0)
+        probe.guard_message(guard, f"{member.pid}\n".encode())
+        guard.stdin.close()
+        self.assertEqual(member.wait(timeout=10), 3)
+        guard.wait(timeout=10)
+        # ... and only a group still present after it is killed.
+        member, guard = handling(None), probe.start_guard(grace=0.5)
+        probe.guard_message(guard, f"{member.pid}\n".encode())
+        started = time.monotonic()
+        guard.stdin.close()
+        self.assertEqual(member.wait(timeout=10), -signal.SIGKILL)
+        self.assertGreaterEqual(time.monotonic() - started, 0.4)
+        guard.wait(timeout=10)
+        # Signals to the tool's terminal or group do not reach it: it has its own session.
+        guard = probe.start_guard()
+        self.addCleanup(lambda: (guard.stdin.close(), guard.kill(), guard.wait()))
+        self.assertNotEqual(os.getpgid(guard.pid), os.getpgrp())
+        self.assertEqual(os.getsid(guard.pid), guard.pid)
+
+    def test_session_is_not_started_without_a_working_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # An interpreter that cannot start (a missing loader path, for instance).
+            broken = root / "broken-python"
+            broken.write_text("#!/bin/sh\nexit 127\n")
+            broken.chmod(0o700)
+            session = root / "session"
+            session.write_text(f"#!{sys.executable}\nopen({str(root / 'started')!r}, 'w').close()\n")
+            session.chmod(0o700)
+            args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
+                             label="host-a", mode="rail", app="||probe", output=root / "runs",
+                             display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
+            with patch.object(probe, "doctor", return_value={"target_ready": True}), \
+                 patch.object(probe, "verified_binary", return_value=(session,
+                         {"system": "Linux", "native_wayland_helpers": True})), \
+                 patch.object(probe.sys, "executable", str(broken)), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                with self.assertRaises(probe.ProbeError) as raised:
+                    probe.run(args)
+            self.assertIn("guard did not start", str(raised.exception))
+            self.assertFalse((root / "started").exists())
+            self.assertEqual(json.loads(next(args.output.glob("*/exit.json")).read_text())["ended"], "aborted")
 
     def test_event_cap_and_failed_session_are_recorded(self):
         with tempfile.TemporaryDirectory() as directory:
