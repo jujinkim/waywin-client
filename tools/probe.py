@@ -232,6 +232,9 @@ def endpoint(value: str) -> str:
         if len(host) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part)
                                       for part in host.rstrip(".").split(".")):
             raise ProbeError("Invalid DNS name")
+        # The resolver reads names such as 1.2.3, 999.1.1.1 or 0x7f.1 as legacy IPv4 forms.
+        if re.fullmatch(r"[0-9]+|0[xX][0-9A-Fa-f]*", host.rstrip(".").split(".")[-1]):
+            raise ProbeError("Invalid IP address")
     return f"{host}:{port}"
 
 
@@ -253,8 +256,9 @@ def display_config(mode: str, display_mode: str = "auto", monitors: str | None =
         if resolved != "multimon" or not re.fullmatch(r"[0-9]{1,10}(?:,[0-9]{1,10}){0,15}", monitors):
             raise ProbeError("Monitor selection requires multimon and 1..16 SDL display IDs")
         ids = [int(value) for value in monitors.split(",")]
-        if len(set(ids)) != len(ids) or any(not 1 <= value <= 0xFFFFFFFF for value in ids):
-            raise ProbeError("SDL display IDs must be unique positive 32-bit values")
+        # The pinned client parses each /monitors value as 0..65535.
+        if len(set(ids)) != len(ids) or any(not 1 <= value <= 0xFFFF for value in ids):
+            raise ProbeError("SDL display IDs must be unique values from 1 to 65535")
     if resolved == "multimon" and size is not None:
         raise ProbeError("A fixed window size cannot be combined with monitor layout")
     if resolved == "window":
@@ -269,6 +273,9 @@ def rdp_args(binary: Path, server: str, user: str, domain: str, label: str,
              mode: str, app: str | None, *, display_mode: str = "auto", monitors: str | None = None,
              size: str | None = None, dynamic: bool = False) -> list[str]:
     display = display_config(mode, display_mode, monitors, size, dynamic)
+    if "\\" in user:
+        # FreeRDP would split DOMAIN\\user itself; the domain has its own option here.
+        raise ProbeError("Give the authentication domain with --domain, not inside the user name")
     args = [str(binary), f"/v:{endpoint(server)}", f"/u:{text_option(user, 'user')}",
             f"/t:[{text_option(label, 'label')}] WayWin probe",
             "-clipboard", "/audio-mode:2", "-auto-reconnect", "/timeout:9000",
@@ -534,7 +541,8 @@ def main() -> int:
     inventory = sub.add_parser("list-monitors", help="List local SDL display IDs without an RDP connection")
     inventory.add_argument("--manifest", type=Path, default=BUILD / "build-manifest.json")
     runner = sub.add_parser("run", help="Launch one isolated native Wayland RDP probe")
-    runner.add_argument("--server", required=True)
+    runner.add_argument("--server", required=True,
+                        help="IP, DNS name or rdp://host[:port]; write IPv6 with a port as [address]:port")
     runner.add_argument("--user", required=True)
     runner.add_argument("--domain", default="")
     runner.add_argument("--label", required=True, help="Non-sensitive host label, e.g. host-a")

@@ -35,7 +35,8 @@ class EndpointTests(unittest.TestCase):
     def test_invalid_and_credential_addresses(self):
         for value in ("", "https://pc", "rdp://user:secret@pc", "pc:0", "pc:65536", "pc:",
                       "pc:abc", "pc/path", "pc?x=y", "pc#x", "/p:secret", "pc\n/p:secret",
-                      "pc space", "-bad.host", "rdp://[xyz]", "rdp://", "pc..example"):
+                      "pc space", "-bad.host", "rdp://[xyz]", "rdp://", "pc..example",
+                      "999.1.1.1", "1.2.3", "0x7f.1", "2130706433", "pc.123"):
             with self.subTest(value=value), self.assertRaises(probe.ProbeError): probe.endpoint(value)
 
     def test_domain_is_separate_and_no_secret_or_redirection_flags(self):
@@ -56,6 +57,17 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(argv[-1], "/app:program:C:\\Program Files\\WayWin\\probe.exe")
         with self.assertRaises(probe.ProbeError):
             probe.rdp_args(Path("binary"), "pc", "alice", "", "a", "desktop", "notepad")
+
+    def test_text_options_reject_control_characters_and_embedded_domain(self):
+        base = dict(server="pc", user="alice", domain="ACME", label="host-a")
+        for field, value in (("user", "ACME\\alice"), ("user", ""), ("user", "a\nb"), ("user", "a" * 257),
+                             ("domain", "AC\x7fME"), ("label", "host\ta"), ("label", "")):
+            with self.subTest(field=field, value=value), self.assertRaises(probe.ProbeError):
+                options = {**base, field: value}
+                probe.rdp_args(Path("binary"), options["server"], options["user"], options["domain"],
+                               options["label"], "desktop", None)
+        argv = probe.rdp_args(Path("binary"), "pc", "alice@example.test", "", "host-a", "desktop", None)
+        self.assertIn("/u:alice@example.test", argv)
 
     def test_cli_does_not_echo_rejected_password(self):
         result = subprocess.run([sys.executable, ROOT / "tools/probe.py", "run", "--password", "SECRET-SENTINEL"],
@@ -82,9 +94,10 @@ class DisplayTests(unittest.TestCase):
         self.assertIn("/monitors:3,1", args)
         self.assertNotIn("/size:1280x720", args)
         self.assertIn("/monitors:2", self.argv("rail", monitors="2"))
+        self.assertIn("/monitors:65535", self.argv("rail", monitors="65535"))
 
     def test_invalid_ids_and_contradictory_modes_rejected(self):
-        for monitors in ("0", "1,1", "-1", "4294967296", "1,", "1,2/p:secret", "1, 2", "", ",".join(str(n) for n in range(1, 18))):
+        for monitors in ("0", "1,1", "-1", "65536", "4294967296", "1,", "1,2/p:secret", "1, 2", "", ",".join(str(n) for n in range(1, 18))):
             with self.subTest(monitors=monitors), self.assertRaises(probe.ProbeError):
                 self.argv(display_mode="multimon", monitors=monitors)
         for mode, options in (("rail", {"display_mode": "window"}), ("desktop", {"monitors": "1"}),
