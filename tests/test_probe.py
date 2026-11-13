@@ -47,6 +47,7 @@ class EndpointTests(unittest.TestCase):
         self.assertIn("-auto-reconnect", argv)
         # Only the protocol without certificate validation is switched off; TLS and NLA stay available.
         self.assertEqual([x for x in argv if x.startswith("/sec:")], ["/sec:rdp:off"])
+        self.assertEqual([x for x in argv if x.startswith("/proxy")], ["/proxy:ignore"])
         self.assertFalse(any(x.startswith(("/p:", "/cert:", "/drive:", "/microphone")) for x in argv))
 
     def test_rail_single_program_and_no_options_injection(self):
@@ -163,6 +164,23 @@ class EventTests(unittest.TestCase):
 
 
 class EnvironmentTests(unittest.TestCase):
+    def test_session_environment_drops_variables_that_redirect_the_client(self):
+        dropped = {"FREERDP_ASKPASS": "/tmp/askpass", "https_proxy": "http://proxy.test:3128",
+                   "HTTPS_PROXY": "http://proxy.test:3128", "no_proxy": "*", "all_proxy": "socks5://proxy.test",
+                   "LD_PRELOAD": "/tmp/x.so", "LD_LIBRARY_PATH": "/tmp", "DYLD_INSERT_LIBRARIES": "/tmp/x.dylib",
+                   "OPENSSL_CONF": "/tmp/openssl.cnf", "OPENSSL_MODULES": "/tmp", "SSL_CERT_FILE": "/tmp/ca.pem",
+                   "SSL_CERT_DIR": "/tmp", "SSLKEYLOGFILE": "/tmp/keys", "WLOG_APPENDER": "FILE",
+                   "WLOG_FILEAPPENDER_OUTPUT_FILE_PATH": "/tmp", "WINPR_X": "1", "WTSAPI_LIBRARY": "/tmp/x.so",
+                   "SDL_VIDEODRIVER": "x11", "GTK_MODULES": "x", "GIO_EXTRA_MODULES": "/tmp", "TZDIR": "/tmp"}
+        kept = {"WAYLAND_DISPLAY": "wayland-0", "XDG_RUNTIME_DIR": "/run/user/1000", "HOME": "/home/test",
+                "XDG_CONFIG_HOME": "/home/test/.config", "LANG": "ko_KR.UTF-8", "XMODIFIERS": "@im=ibus",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus", "PATH": "/usr/bin", "TZ": "Asia/Seoul"}
+        with patch.dict(os.environ, {**dropped, **kept}, clear=True):
+            env = probe.session_environment()
+        self.assertEqual({key: env[key] for key in kept}, kept)
+        self.assertEqual(set(env) - set(kept), {"SDL_VIDEO_DRIVER", "WAYWIN_PROBE_EVENTS", "WLOG_LEVEL", "WLOG_APPENDER"})
+        self.assertEqual((env["SDL_VIDEO_DRIVER"], env["WLOG_APPENDER"], env["WLOG_LEVEL"]), ("wayland", "CONSOLE", "ERROR"))
+
     def test_macos_not_mistaken_for_target(self):
         with patch.object(probe.platform, "system", return_value="Darwin"):
             self.assertFalse(probe.doctor()["target_ready"])

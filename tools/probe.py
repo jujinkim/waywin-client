@@ -39,6 +39,14 @@ EVENT_PATTERN = re.compile(
 DRIVERS = ("wayland", "x11", "cocoa", "windows", "dummy", "offscreen")
 EVENT_LIMIT = 100000
 GROUP_GRACE = 2.0
+# Inherited variables that would change where the password comes from, how the connection is
+# routed, which code is loaded or where diagnostics go. This is a deny-list: an allow-list would
+# be stricter, but input method and keyboard variables cannot be verified off the target.
+ENV_DROP_PREFIXES = ("WLOG_", "SDL_", "FREERDP_", "WINPR_", "LD_", "DYLD_", "OPENSSL_", "SSL_CERT_")
+ENV_DROP_NAMES = frozenset({
+    "WTSAPI_LIBRARY", "SSLKEYLOGFILE", "TZDIR", "GCONV_PATH", "LOCPATH", "GTK_MODULES", "GTK_PATH",
+    "GIO_EXTRA_MODULES", "GIO_MODULE_DIR", "QT_PLUGIN_PATH", "LIBDECOR_PLUGIN_DIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"})
 CASES = {
     "P01": "Native Wayland: display, move, resize, input, popups",
     "P02": "Existing AND new windows discovered; representative app inventory",
@@ -323,7 +331,9 @@ def rdp_args(binary: Path, server: str, user: str, domain: str, label: str,
             f"/t:[{text_option(label, 'label')}] WayWin probe",
             "-clipboard", "/audio-mode:2", "-auto-reconnect", "/timeout:9000",
             # Standard RDP Security has no certificate check; a server could select it to skip validation.
-            "/sec:rdp:off", "/log-level:ERROR"]
+            "/sec:rdp:off",
+            # Direct connection only; without this the client reads https_proxy on its own.
+            "/proxy:ignore", "/log-level:ERROR"]
     if display["mode"] == "multimon":
         args.append("/multimon")
         if display["monitor_ids"]:
@@ -422,11 +432,8 @@ def verified_binary(manifest_path: Path) -> tuple[Path, dict]:
 
 
 def session_environment() -> dict:
-    env = os.environ.copy()
-    # Raw upstream file logging must not be inherited by a probe or inventory command.
-    for key in list(env):
-        if key.startswith("WLOG_") or key.startswith("SDL_"):
-            del env[key]
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(ENV_DROP_PREFIXES) and key.upper() not in ENV_DROP_NAMES}
     env.update(SDL_VIDEO_DRIVER="wayland", WAYWIN_PROBE_EVENTS="1", WLOG_LEVEL="ERROR",
                WLOG_APPENDER="CONSOLE")
     return env
