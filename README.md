@@ -15,4 +15,4 @@ Windows RDP 사용자 세션의 창과 셸 기능을 Ubuntu GNOME Wayland에 통
 
 최종 구조는 Qt 6/C++ 관리 GUI, 호스트별 FreeRDP/SDL 3 세션 프로세스, 같은 저장소의 Windows 보조 앱입니다. 서버 주소와 인증 도메인을 분리하고, 비밀번호는 선택한 경우에만 OS 키링에 저장합니다. 키링 장애 시 평문 파일로 대체하지 않습니다.
 
-GitHub: `git@github.com:jujinkim/waywin-client.git`. 이 작업에서는 로컬 커밋만 수행합니다.
+GitHub: `git@github.com:jujinkim/waywin-client.git`. 원격 푸시는 명시적 승인이 있을 때만 합니다.

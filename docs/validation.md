@@ -7,13 +7,13 @@
 - `tools/probe.py`: 소스 검증·빌드, 환경 점검, 호스트별 별도 SDL3 프로세스 실행, 제한된 이벤트 수집, 수동 결과 기록 검사. Python 3.10 이상, 표준 라이브러리만 사용한다.
 - `patches/freerdp-3.33.1-probe.patch`: SDL3 `sdl_rail.cpp` 하나에만 관측 코드를 추가한다. `WAYWIN_PROBE_EVENTS=1`일 때만 동작한다. 창 생성/삭제, 알림 아이콘 생성/변경/삭제, 모니터링 전환, SDL 드라이버를 기록한다. **트레이 렌더링이나 클릭 전달은 구현하지 않는다.**
 - `windows/probe`: 네이티브 Win32 GUI 시험 앱. 세션 ID·PID·인스턴스 UUID·경과 시간·세션 화면 수/가상 영역·DPI, 편집 가능한 임시 텍스트, 문서 창 생성/지연 생성/최소화/복원/크기 변경, 모달 팝업, 트레이 생성/변경/삭제/클릭/메뉴, Notepad와 실제 셸 UI 열기를 제공한다. 네트워크 수신·자동 시스템 설정 변경·키 입력 기록을 하지 않는다. 조작은 메뉴바의 Documents / Tray / Windows shell에 있다.
-- `cmake/FreeRDPProbe.cmake`: 시험용 빌드 프로필. 영상 최적화·Kerberos·장치 공유 기능 일부를 끈 기본 경로이다. 이 프로필로 최종 성능·도메인 인증·음성 기능을 평가하지 않는다.
+- `cmake/FreeRDPProbe.cmake`: 시험용 빌드 프로필. 영상 최적화·Kerberos·장치 공유 기능 일부를 끈 기본 경로이다. 이 프로필로 최종 성능·도메인 인증·음성 기능을 평가하지 않는다. H.264 복호기가 없고 그래픽 옵션을 지정하지 않으므로 기획의 1080p·30fps 측정 목표는 이 빌드로 측정할 수 없다. 컴파일러 보호 옵션(스택 보호·FORTIFY 등)은 프로필이 지정하지 않으며 배포판 툴체인 기본값을 따른다.
 
 Windows 시험 앱은 최종 보조 앱이 아니다. Notepad와 Windows shell 메뉴는 해당 사용자 세션에서 앱/UI를 실행하는 기초 시험이다. DVC 통신, 설치/설정 UI, 원격 명령 수신은 아직 없다. 메뉴 호출 성공은 해당 UI가 RAIL로 미러링되었다는 뜻이 아니다.
 
 ## 빌드와 출처
 
-FreeRDP는 `dependencies.lock.json`의 태그와 커밋을 모두 검사한다. 원본은 `.cache/FreeRDP-3.33.1`, 결과는 `build/freerdp-probe`에 둔다. 예상한 패치 이외의 변경이 있으면 중단하며 기존 변경을 지우지 않는다. 기존 시스템 FreeRDP를 덮어쓰지 않는다.
+FreeRDP는 `dependencies.lock.json`의 태그로 내려받고 커밋 해시로 검사한다. 태그 서명은 검증하지 않으며, 이미 있는 캐시는 커밋만 확인한다. 내려받기는 임시 경로에 한 뒤 옮기므로 중단된 내려받기가 완성본으로 취급되지 않는다. `prepare`와 `build`는 동시에 하나만 실행된다. 원본은 `.cache/FreeRDP-3.33.1`, 결과는 `build/freerdp-probe`에 둔다. 예상한 패치 이외의 변경이 있으면 중단하며 기존 변경을 지우지 않는다. 기존 시스템 FreeRDP를 덮어쓰지 않는다.
 
 Ubuntu 26.04 준비 명령(이번 macOS 세션에서는 실행하지 않음):
 
@@ -35,7 +35,7 @@ c++ --version
 
 macOS에서는 CMake, Ninja, SDL3, SDL3_ttf, OpenSSL 개발 파일이 필요하다. 기본 `python3`가 Apple 제공 3.9라면 설치된 3.10 이상 인터프리터의 경로를 사용한다. macOS 빌드는 소스·링크 검증만 수행하며 `run`은 이 환경을 거부한다.
 
-Windows 시험 앱은 Visual Studio의 C++ 개발 환경과 CMake에서 빌드한다. Python은 검증 도구·자동 테스트를 실행할 때 필요하다.
+Windows 시험 앱은 Visual Studio의 C++ 개발 환경과 CMake에서 빌드한다. Python 검증 도구와 자동 테스트는 Ubuntu/macOS용이다. 프로세스·권한·소켓 관련 테스트는 POSIX를 전제로 하므로 Windows에서 실행하지 않는다(위 명령의 `-DBUILD_TESTING=OFF`).
 
 ```powershell
 cmake -S . -B build/windows-native -A x64 -DBUILD_TESTING=OFF
@@ -64,7 +64,7 @@ ctest --test-dir build/checks --output-on-failure
 1. Ubuntu 설정에서 GNOME Wayland로 로그인했는지 확인한다. `python3 tools/probe.py doctor`가 성공해야 한다. OS·세션 환경과 Wayland 소켓 존재를 검사할 뿐, 실제 SDL 드라이버나 RDP 호환성을 증명하지 않는다.
 2. Windows 설정의 에디션·전체 OS 빌드, 원격 데스크톱 설정·사용자 권한, 적용된 RemoteApp 정책·앱 별칭을 기록한다. 일반 Windows 11에서 모든 창의 RAIL 전송이 된다고 가정하지 않는다. 표준 설정으로 RemoteApp를 허용할 수 없다면 해당 시험을 `blocked`로 기록한다. 정책·앱 등록을 자동으로 바꾸는 스크립트는 제공하지 않는다.
 3. 시험 앱을 원하는 RDP **사용자 세션**에서 실행한다. 물리 콘솔 공유를 시험하지 않는다. Session/PID/Instance를 기록하고 임시 편집칸에 무관한 시험 문구를 입력한다. UUID는 프로세스가 다시 실행됐는지 확인하는 표식이다. 서로 다른 인스턴스가 있으면 중복 실행으로 기록한다.
-4. 시험 호스트에는 `host-a`, `host-b` 같은 별칭을 사용한다. 비밀번호를 명령행·보고서·채팅에 넣지 않는다. 비밀번호는 SDL GUI 대화상자에서 입력한다. 인증서 확인은 기존 SDL GUI를 사용하며 신뢰 여부는 실제 인증서와 대조한다. 검증 해제 옵션은 제공하지 않는다. 인증서 확인이 없는 표준 RDP 보안은 `/sec:rdp:off`로 꺼 두며 TLS와 NLA만 협상한다. 서버가 둘 다 허용하지 않으면 접속은 실패하고, 이는 `blocked`로 기록한다.
+4. 시험 호스트에는 `host-a`, `host-b` 같은 별칭을 사용한다. 비밀번호를 명령행·보고서·채팅에 넣지 않는다. 비밀번호는 SDL GUI 대화상자에서 입력한다. 인증서 확인은 기존 SDL GUI를 사용하며 신뢰 여부는 실제 인증서와 대조한다. 검증 해제 옵션은 제공하지 않는다. 인증서 대화상자에서 Enter의 기본 동작은 "이번 접속만 수락"이므로 지문을 대조하기 전에 Enter를 누르지 않는다. 호스트 이름 불일치는 대화상자에 따로 표시되지 않으므로 표시된 주체 이름을 직접 확인한다. 수락한 인증서는 사용자의 FreeRDP 설정(`~/.config/freerdp/server/`)에 저장되어 **다른 FreeRDP 클라이언트 및 모든 시험 호스트와 공유된다.** 인증서 변경 시험 전후에는 해당 호스트 파일의 상태를 기록한다. 인증서 확인이 없는 표준 RDP 보안은 `/sec:rdp:off`로 꺼 두며 TLS와 NLA만 협상한다. 서버가 둘 다 허용하지 않으면 접속은 실패하고, 이는 `blocked`로 기록한다.
 
 ## 실행
 
@@ -100,6 +100,10 @@ python3 tools/probe.py run --server windows.example --user alice --label host-a 
 위 `2,1`과 `2`는 실제 조회값으로 바꾼다. 첫 ID가 요청한 원격 주 모니터이다. `--display-mode auto` 기본값은 데스크톱에서 1280×720 창, RAIL에서 전체 모니터 배치이다. RAIL 한 화면 시험도 `--monitors <하나의 ID>`로 한다. RAIL에 고정 1280×720을 전달하여 단일 모니터라고 오해하지 않도록 바꿨다. 단일 데스크톱 창 크기는 `--size 1920x1080`처럼 지정한다. 모니터 배치 모드와 고정 크기 조합은 거부한다.
 
 `--dynamic-resolution`은 display-control 변경을 시험하는 명시적 옵션이며 기본은 꺼져 있다. 켜졌다는 것만으로 hotplug 지원을 보장하지 않는다. 특히 새 모니터가 선택 목록에 없는데 세션에 추가되는지, 제거된 모니터의 원격 창을 남은 화면에서 복구할 수 있는지 확인한다. `run.json`의 `requested_display`는 **요청값**이며 Windows 시험 앱의 세션 화면 수/영역 및 디스플레이 설정에서 실제 결과를 대조한다.
+
+세션 프로세스에는 비밀번호 입력 경로·프록시·로더·OpenSSL 설정을 바꾸는 환경 변수(`FREERDP_*`, `*_proxy`, `LD_*`, `OPENSSL_*`, `SSL_CERT_*` 등)를 넘기지 않고 `/proxy:ignore`로 직접 연결만 한다. 프록시를 거쳐야만 닿는 서버는 이 도구로 시험할 수 없다. 표준 경로 밖의 SDL3를 `LD_LIBRARY_PATH`로 찾던 환경에서는 실행이 실패하므로 시스템 패키지를 쓴다. 서버 주소·사용자·도메인은 세션 프로세스의 인자로 전달되어 같은 PC의 다른 사용자가 프로세스 목록에서 볼 수 있다.
+
+`run`은 빌드 명세(`build-manifest.json`)의 실행파일과 빌드 디렉터리의 모든 공유 라이브러리 해시가 현재 파일과 일치할 때만 실행한다. 명세 자체는 서명되지 않으므로 이는 오래되거나 바뀐 빌드를 걸러내는 검사이며 출처 증명이 아니다.
 
 `out/runs/<UUID>/run.json`, `events.jsonl`, `exit.json`은 로컬 증거이다. 파일 0600, 실행 디렉터리 0700, 이벤트 최대 100,000개이며 상한 도달은 `events_truncated`로 기록한다. 일반 로그를 수집하지 않는다. 데이터는 자동 업로드하지 않고 `.gitignore`에서 제외한다. 로그 수신은 실제 화면·입력 성공 증거가 아니다. `exit.json`의 `ended`는 세션이 스스로 끝났는지(`session-exit`), 사용자가 중단했는지(`interrupted`), 도구가 중단했는지(`aborted`)를 구분하고, `exit_code`는 세션이 스스로 끝난 경우에만 채운다. 중단한 실행의 도구 종료 코드는 130이다. `sdl_driver_observed`가 `wayland`인지 RAIL 실행에서 확인한다. 목록에 없는 드라이버는 `unknown`으로 기록하고 실행을 중단한다. 데스크톱 전용 실행은 RAIL 초기화가 없어 드라이버 관측 이벤트가 없으며 이 값은 `null`이다. 보고서의 `sdl_driver`는 이 관측값이 있는 실행을 근거로 적는다.
 
