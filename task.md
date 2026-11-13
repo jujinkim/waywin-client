@@ -84,6 +84,31 @@ Windows 셸 메뉴의 실제 실행·RAIL 별도 전송, GNOME 혼합 배율·ho
 
 재검증: **자동 테스트 69개 통과**(Python 3.12), CTest 통과, 실제 캐시로 `prepare` 통과, macOS 재빌드와 새 명세 검증 통과. 독립 검토는 워크플로로 네 관점(패치·Git 환경·테스트·문서)을 나눠 수행하고 지적마다 재현을 시도했다. 이 단위 이후의 다음 작업은 여전히 실제 Ubuntu 26.04에서의 동일 프로필 빌드와 Windows 11 RAIL 경로·P01–P03 조사이다. 사용자 요청에 따라 `main`에 커밋하고 `origin/main`에 푸시한다.
 
+## 보류: 세션 정리를 cgroup으로 대체 (Ubuntu 확인 후)
+
+위 두 단계의 세션 정리는 감시 프로세스, 시작 관문, 프로세스 그룹·세션 ID·환경 표식 검색을 조합한 것이다. 프로세스는 그룹과 세션을 마음대로 떠날 수 있으므로 이 방식은 경우를 하나씩 막는 데 그치고, 막을 때마다 새 경로와 새 결함이 생겼다. 사용자 결정에 따라 이 방식의 보완은 여기서 멈춘다. Ubuntu 실환경을 쓸 수 있게 되면 아래 cgroup 방식으로 바꾸는 것을 검토한다. 아래 내용은 **이 PC에서 확인하지 않은 설계 메모**이며, "확인 필요"로 표시한 동작은 Ubuntu 26.04에서 직접 확인한 뒤에만 근거로 쓴다.
+
+**생각**: 세션을 사용자 systemd 아래의 전용 transient scope(자기 cgroup)에서 시작한다. cgroup에 속한 프로세스는 `setsid`·`setpgid`·이중 fork·환경 삭제와 상관없이 cgroup을 벗어나지 못하므로(권한 없는 프로세스 기준), 세션이 만든 것 전체를 한 번에 나열하고 끝낼 수 있다.
+
+- 시작: `systemd-run --user --scope --collect --unit=waywin-probe-<실행 UUID> -- <FreeRDP 인자>`. scope는 실행 UUID로 이름을 붙여 실행 기록과 1:1로 대응시킨다.
+- 정상 종료·중단: `systemctl --user kill --signal=SIGTERM <unit>`, 유예 후 `systemctl --user kill --signal=SIGKILL <unit>`(또는 `systemctl --user stop`). 커널이 지원하면 `cgroup.kill`도 후보.
+- 도구가 SIGKILL된 경우: scope는 도구와 무관하게 남으므로 끝낼 주체가 여전히 필요하다. 후보는 셋이다. (a) 지금의 감시 프로세스를 "파이프가 닫히면 그 scope를 끝낸다"로만 줄인다. (b) 다음 `run`이 시작할 때 남아 있는 `waywin-probe-*.scope`를 찾아 끝내고 기록한다. (c) scope에 `RuntimeMaxSec=` 같은 상한을 둔다. (a)+(b)가 유력하다.
+- 없앨 수 있는 것: 시작 관문(대기 프로그램과 환경 전달 파이프), 실행 표식 환경 변수, `/proc`·`ps` 검색과 재검색 반복, 감시 프로세스 교체. 남는 감시 프로세스는 "scope 이름 하나를 끝낸다"만 한다.
+
+**Ubuntu에서 확인할 것**
+
+- [ ] `systemd-run --scope`가 명령을 같은 PID로 실행하는지(`Session process` PID와 stderr 파이프·종료 코드 전달이 지금처럼 유지되는지). 확인 필요.
+- [ ] scope 안의 명령이 도구가 넘긴 환경(`session_environment()`)을 그대로 받는지, `systemd-run`이 변수를 더하거나 빼는지. 확인 필요.
+- [ ] 사용자 systemd·세션 버스가 필요하므로 `session_environment()`가 `DBUS_SESSION_BUS_ADDRESS`·`XDG_RUNTIME_DIR`를 남기는지, `doctor`가 `systemd-run --user` 사용 가능 여부를 검사해야 하는지. SSH 로그인처럼 사용자 버스가 없는 경우의 실패 문구.
+- [ ] `setsid`·이중 fork·환경 삭제 후 떠난 프로세스가 실제로 같은 cgroup에 남고 함께 끝나는지(지금 테스트의 각 경우를 그대로 재현).
+- [ ] SIGTERM 유예 후 SIGKILL, 정리 중 새로 생기는 프로세스, scope 이름 충돌·`--collect` 후 정리 상태.
+- [ ] 도구 SIGKILL 시 (a)/(b) 후보 동작과, 도구·감시 프로세스 동시 SIGKILL 시 (b)로 다음 실행에서 정리되는지.
+- [ ] GNOME이 앱을 `app-*.scope`로 관리하는 방식과 충돌하지 않는지, 입력기·Wayland 연결 등 세션 동작이 scope 안에서 달라지지 않는지(P01과 함께 확인).
+
+**cgroup으로도 남는 것**: D-Bus 활성화나 포털·`xdg-open`처럼 세션의 요청을 받아 **다른 unit에서** 시작되는 프로세스는 이 cgroup에 들어오지 않는다. 이것은 세션이 직접 만든 프로세스가 아니므로 별도로 기록한다.
+
+전환 전까지는 지금의 감시 프로세스 방식을 유지한다. 전환은 Ubuntu에서 위 항목을 확인한 뒤 별도 커밋으로 하고, 그때 지금의 관련 테스트를 cgroup 기준으로 다시 작성한다.
+
 ## 진행
 
 - [x] 빈 Git 저장소·PC 지침·필수 웹 지침(v1 revision 8) 재확인.
