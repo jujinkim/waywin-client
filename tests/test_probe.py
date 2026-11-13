@@ -333,6 +333,134 @@ class ProvenanceTests(unittest.TestCase):
             with self.assertRaises(probe.ProbeError): probe.verified_binary(manifest)
 
 
+class PrepareTests(unittest.TestCase):
+    """prepare() against a throwaway upstream repository; no network."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name).resolve()
+        self.clean = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        self.upstream = root / "upstream"
+        self.upstream.mkdir()
+        (self.upstream / "file.txt").write_text("".join(f"line {number}\n" for number in range(20)))
+        self.git(self.upstream, "init", "--quiet")
+        self.git(self.upstream, "add", "file.txt")
+        self.git(self.upstream, "commit", "--quiet", "--message", "base")
+        self.git(self.upstream, "tag", "v1")
+        commit = self.git(self.upstream, "rev-parse", "HEAD").strip()
+        (self.upstream / "file.txt").write_text("".join(
+            "observed\n" if number == 7 else f"line {number}\n" for number in range(20)))
+        self.patch_file = root / "probe.patch"
+        self.patch_file.write_text(self.git(self.upstream, "diff", "--binary", "--no-ext-diff", "HEAD"))
+        self.git(self.upstream, "checkout", "--quiet", "--", "file.txt")
+        self.source = root / "cache" / "source"
+        dependency = {"repository": self.upstream.as_uri(), "tag": "v1", "commit": commit,
+                      "probe_patch_sha256": probe.sha256(self.patch_file)}
+        for name, value in (("SOURCE", self.source), ("PATCH", self.patch_file)):
+            patcher = patch.object(probe, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for patcher in (patch.object(probe, "lock", return_value={"freerdp": dependency}),
+                        patch.dict(os.environ, self.clean)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.dependency = dependency
+
+    def git(self, directory, *arguments):
+        return subprocess.run(["git", "-C", directory, "-c", "user.name=test", "-c", "user.email=test@localhost",
+                               *arguments], check=True, capture_output=True, text=True, env=self.clean).stdout
+
+    def test_fetches_applies_once_and_is_repeatable(self):
+        probe.prepare()
+        self.assertIn("observed\n", (self.source / "file.txt").read_text())
+        self.assertFalse(self.source.with_name("source.partial").exists())
+        before = (self.source / "file.txt").read_bytes()
+        probe.prepare()
+        self.assertEqual((self.source / "file.txt").read_bytes(), before)
+
+    def test_other_changes_and_untracked_files_are_kept_and_rejected(self):
+        probe.prepare()
+        (self.source / "file.txt").write_text((self.source / "file.txt").read_text() + "developer change\n")
+        with self.assertRaises(probe.ProbeError): probe.prepare()
+        self.assertIn("developer change", (self.source / "file.txt").read_text())
+        self.git(self.source, "checkout", "--quiet", "--", "file.txt")
+        probe.prepare()
+        (self.source / "note.txt").write_text("untracked")
+        with self.assertRaises(probe.ProbeError): probe.prepare()
+        self.assertTrue((self.source / "note.txt").exists())
+
+    def test_wrong_patch_or_commit_is_rejected(self):
+        self.dependency["probe_patch_sha256"] = "0" * 64
+        with self.assertRaises(probe.ProbeError): probe.prepare()
+        self.assertFalse(self.source.exists())
+        self.dependency["probe_patch_sha256"] = probe.sha256(self.patch_file)
+        self.dependency["commit"] = "0" * 40
+        with self.assertRaises(probe.ProbeError): probe.prepare()
+        self.assertNotIn("observed\n", (self.source / "file.txt").read_text())
+
+    def test_interrupted_fetch_is_recovered_and_incomplete_cache_is_refused(self):
+        leftover = self.source.with_name("source.partial")
+        leftover.mkdir(parents=True)
+        (leftover / "half-written").write_text("x")
+        probe.prepare()
+        self.assertFalse(leftover.exists())
+        self.assertIn("observed\n", (self.source / "file.txt").read_text())
+        # A directory that is not its own repository must not be answered for by an enclosing one.
+        outer = Path(self.directory.name).resolve() / "outer"
+        outer.mkdir()
+        self.git(outer, "init", "--quiet")
+        empty = outer / "cache" / "source"
+        empty.mkdir(parents=True)
+        with patch.object(probe, "SOURCE", empty), self.assertRaises(probe.ProbeError) as raised:
+            probe.prepare()
+        self.assertIn("not a complete checkout", str(raised.exception))
+
+    def test_failures_name_the_step_without_arguments(self):
+        self.dependency["repository"] = (Path(self.directory.name) / "SECRET-SENTINEL-missing").as_uri()
+        with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(probe.ProbeError) as raised:
+            probe.prepare()
+        self.assertIn("Fetching the pinned FreeRDP source failed", str(raised.exception))
+        self.assertNotIn("SECRET-SENTINEL", str(raised.exception))
+        with patch.object(probe.subprocess, "run", side_effect=FileNotFoundError), \
+             self.assertRaises(probe.ProbeError) as raised:
+            probe.command(["missing-program", "SECRET-SENTINEL"], step="Example step")
+        self.assertEqual(str(raised.exception), "Example step: the program is not installed or not on PATH")
+
+    @unittest.skipUnless(os.name == "posix", "advisory lock is POSIX only")
+    def test_second_prepare_or_build_is_refused_while_one_runs(self):
+        with probe.exclusive_cache():
+            with self.assertRaises(probe.ProbeError), probe.exclusive_cache():
+                pass
+        with probe.exclusive_cache():
+            pass
+
+
+class CommandLineTests(unittest.TestCase):
+    def cli(self, *arguments):
+        return subprocess.run([sys.executable, ROOT / "tools/probe.py", *arguments], capture_output=True, text=True)
+
+    def test_exit_codes_and_report_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            self.assertEqual(self.cli("new-report", report).returncode, 0)
+            self.assertEqual(self.cli("new-report", report).returncode, 2)  # never overwritten
+            result = self.cli("assess", report)
+            self.assertEqual(result.returncode, 2)
+            output = json.loads(result.stdout)
+            self.assertFalse(output["record_complete"])
+            self.assertFalse(output["independently_verified"])
+            self.assertTrue(output["problems"])
+            missing = self.cli("assess", Path(directory) / "SECRET-SENTINEL.json")
+            self.assertEqual(missing.returncode, 2)
+            self.assertNotIn("SECRET-SENTINEL", missing.stdout + missing.stderr)
+            self.assertNotIn("Traceback", missing.stderr)
+
+    def test_example_report_matches_the_template(self):
+        example = json.loads((ROOT / "docs/feasibility-report.example.json").read_text(encoding="utf-8"))
+        self.assertEqual(example, probe.report_template())
+
+
 @unittest.skipUnless(os.name == "posix", "POSIX probe launcher")
 class LaunchTests(unittest.TestCase):
     def test_wrong_driver_aborts_and_reaps_real_child(self):

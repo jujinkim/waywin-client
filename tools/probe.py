@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import ipaddress
@@ -12,6 +13,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -82,11 +84,34 @@ def lock() -> dict:
     return json.loads(LOCK_PATH.read_text())
 
 
-def command(args: list[str | Path], *, capture: bool = False, env: dict | None = None) -> str:
-    result = subprocess.run([str(a) for a in args], check=True,
-                            stdout=subprocess.PIPE if capture else None,
-                            text=True, env=env)
+def command(args: list[str | Path], *, step: str, capture: bool = False, env: dict | None = None) -> str:
+    # Failures name the fixed step only; arguments and captured output are never repeated.
+    try:
+        result = subprocess.run([str(a) for a in args], check=True,
+                                stdout=subprocess.PIPE if capture else None,
+                                text=True, env=env)
+    except FileNotFoundError:
+        raise ProbeError(f"{step}: the program is not installed or not on PATH") from None
+    except subprocess.CalledProcessError as error:
+        raise ProbeError(f"{step} failed with exit status {error.returncode}; see its output above") from None
     return result.stdout or ""
+
+
+@contextlib.contextmanager
+def exclusive_cache():
+    # prepare and build share one source checkout and one build directory.
+    SOURCE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SOURCE.parent / "probe.lock", "w") as handle:
+        try:
+            import fcntl
+        except ImportError:  # Not POSIX: no advisory lock available.
+            yield
+            return
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ProbeError("Another prepare or build is using this checkout; wait for it to finish") from None
+        yield
 
 
 def source_diff() -> str:
@@ -100,7 +125,7 @@ def source_diff() -> str:
                     "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
                     "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "--inter-hunk-context=0",
                     "--diff-algorithm=myers", "--indent-heuristic", "--abbrev=7", "HEAD"],
-                   capture=True, env=env)
+                   step="Comparing the dependency source with the patch", capture=True, env=env)
 
 
 def private_json(path: Path, data: dict) -> None:
@@ -116,21 +141,34 @@ def prepare() -> None:
     if sha256(PATCH) != dependency["probe_patch_sha256"]:
         raise ProbeError("Probe patch differs from dependencies.lock.json")
     if not SOURCE.exists():
+        # Clone beside the final path and rename, so an interrupted clone never looks complete.
+        partial = SOURCE.with_name(SOURCE.name + ".partial")
+        if partial.is_symlink() or partial.is_file():
+            raise ProbeError("Unexpected file at the temporary clone path; inspect it first")
+        shutil.rmtree(partial, ignore_errors=True)
         SOURCE.parent.mkdir(parents=True, exist_ok=True)
-        command(["git", "clone", "--depth", "1", "--branch", dependency["tag"],
-                 dependency["repository"], SOURCE])
-    if command(["git", "-C", SOURCE, "rev-parse", "HEAD"], capture=True).strip() != dependency["commit"]:
+        command(["git", "-c", "advice.detachedHead=false", "clone", "--depth", "1", "--branch", dependency["tag"],
+                 dependency["repository"], partial], step="Fetching the pinned FreeRDP source")
+        os.rename(partial, SOURCE)
+    # Without its own repository here, git would answer for the enclosing WayWin checkout.
+    top = command(["git", "-C", SOURCE, "rev-parse", "--show-toplevel"],
+                  step="Checking the dependency checkout", capture=True).strip()
+    if not top or Path(top).resolve() != SOURCE.resolve():
+        raise ProbeError("Dependency cache is not a complete checkout; move it aside and run prepare again")
+    if command(["git", "-C", SOURCE, "rev-parse", "HEAD"], step="Reading the dependency commit",
+               capture=True).strip() != dependency["commit"]:
         raise ProbeError("Unexpected source commit; use a separate clean cache")
     # Do not discard developer changes or apply the patch twice.
-    if command(["git", "-C", SOURCE, "ls-files", "--others", "--exclude-standard"], capture=True):
+    if command(["git", "-C", SOURCE, "ls-files", "--others", "--exclude-standard"],
+               step="Listing untracked dependency files", capture=True):
         raise ProbeError("Untracked files in dependency source; inspect them first")
     changes = source_diff()
     expected = PATCH.read_text()
     if changes and changes != expected:
         raise ProbeError("Dependency has changes other than the approved observer patch")
     if not changes:
-        command(["git", "-C", SOURCE, "apply", "--check", PATCH])
-        command(["git", "-C", SOURCE, "apply", PATCH])
+        command(["git", "-C", SOURCE, "apply", "--check", PATCH], step="Checking that the patch applies")
+        command(["git", "-C", SOURCE, "apply", PATCH], step="Applying the patch")
     if source_diff() != expected:
         raise ProbeError("Applied patch differs from expected patch")
 
@@ -163,12 +201,13 @@ def build(jobs: int) -> None:
     manifest = BUILD / "build-manifest.json"
     manifest.unlink(missing_ok=True)
     command(["cmake", "-S", SOURCE, "-B", BUILD, "-G", "Ninja", "-C", PROFILE,
-             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"])
-    command(["cmake", "--build", BUILD, "--target", "sdl3-freerdp", "--parallel", str(jobs)])
+             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"], step="CMake configure")
+    command(["cmake", "--build", BUILD, "--target", "sdl3-freerdp", "--parallel", str(jobs)],
+            step="Building sdl3-freerdp")
     binary = BUILD / "client/SDL/SDL3/sdl3-freerdp"
     if not binary.is_file():
         raise ProbeError("SDL3 executable missing; no verified manifest was written")
-    version = command([binary, "/version"], capture=True).strip()
+    version = command([binary, "/version"], step="Reading the built client's version", capture=True).strip()
     if not re.search(r"\b3\.33\.1\b", version):
         raise ProbeError("Unexpected FreeRDP version")
     compiles = (BUILD / "compile_commands.json").read_text()
@@ -367,7 +406,12 @@ def reap_group_after_exit(child: subprocess.Popen) -> None:
 
 
 def verified_binary(manifest_path: Path) -> tuple[Path, dict]:
-    manifest = json.loads(manifest_path.read_text())
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError):
+        raise ProbeError("Build manifest missing or unreadable; run build first") from None
+    if not isinstance(manifest, dict):
+        raise ProbeError("Build manifest missing or unreadable; run build first")
     binary = (manifest_path.parent / manifest["binary"]).resolve()
     if (manifest.get("schema") != 1 or manifest.get("source_commit") != lock()["freerdp"]["commit"]
             or manifest.get("patch_sha256") != sha256(PATCH)
@@ -395,8 +439,11 @@ def list_monitors(manifest_path: Path) -> int:
     if provenance["system"] != "Linux" or not provenance["native_wayland_helpers"]:
         raise ProbeError("Monitor inventory requires a Linux native Wayland build")
     # No server or credentials; the SDL client exits after enumerating local displays.
-    return subprocess.run([str(binary), "/list:monitor"], env=session_environment(),
-                          stdin=subprocess.DEVNULL, timeout=15, check=False).returncode
+    try:
+        return subprocess.run([str(binary), "/list:monitor"], env=session_environment(),
+                              stdin=subprocess.DEVNULL, timeout=15, check=False).returncode
+    except subprocess.TimeoutExpired:
+        raise ProbeError("Monitor inventory did not finish within 15 seconds") from None
 
 
 def run(args) -> int:
@@ -575,7 +622,8 @@ def main() -> int:
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("prepare", help="Fetch and verify the pinned source; apply observer patch")
     builder = sub.add_parser("build", help="Build a local SDL3 probe, never install system-wide")
-    builder.add_argument("--jobs", type=int, choices=range(1, 65), default=4, metavar="1..64")
+    builder.add_argument("--jobs", type=int, choices=range(1, 65), metavar="1..64",
+                         default=min(os.cpu_count() or 4, 64), help="Parallel compile jobs; default: CPU count")
     sub.add_parser("doctor", help="Check target environment without a connection")
     inventory = sub.add_parser("list-monitors", help="List local SDL display IDs without an RDP connection")
     inventory.add_argument("--manifest", type=Path, default=BUILD / "build-manifest.json")
@@ -601,9 +649,11 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.action == "prepare":
-            prepare()
+            with exclusive_cache():
+                prepare()
         elif args.action == "build":
-            build(args.jobs)
+            with exclusive_cache():
+                build(args.jobs)
         elif args.action == "doctor":
             result = doctor()
             print(json.dumps(result, indent=2))
@@ -619,9 +669,15 @@ def main() -> int:
             print(json.dumps({"record_complete": not problems, "problems": problems,
                               "independently_verified": False}, indent=2))
             return 2 if problems else 0
+    except KeyboardInterrupt:
+        # prepare and build children share the terminal and receive the same Ctrl-C.
+        print("Interrupted.", file=sys.stderr)
+        return 130
     except (ProbeError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-        # Never echo command arguments or source text from input on errors.
+        # Never echo command arguments, paths or source text from input on errors.
         message = str(error) if isinstance(error, ProbeError) else type(error).__name__
+        if isinstance(error, OSError) and error.strerror:
+            message += f" ({error.strerror})"
         print(f"Probe error: {message}", file=sys.stderr)
         return 2
     return 0
