@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -393,16 +394,39 @@ def parse_event(line: bytes) -> dict | None:
     return {"type": "driver", "driver": name if name in DRIVERS else "unknown"}
 
 
-def events(stream):
-    # Bound line buffers even if an upstream diagnostic has no newline.
-    while line := stream.readline(512):
-        if not line.endswith(b"\n"):
-            while line and not line.endswith(b"\n"):
-                line = stream.readline(512)
-            continue
-        event = parse_event(line)
-        if event:
-            yield event
+def pipe_chunks(stream, released: threading.Event):
+    # Read until EOF, or until the pipe is idle after `released` is set: a process that outlived
+    # the session in another process group can hold the write end open indefinitely.
+    descriptor = stream.fileno()
+    while True:
+        if select.select([descriptor], [], [], 0.1)[0]:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                return
+            yield chunk
+        elif released.is_set():
+            return
+
+
+def events(stream, released: threading.Event | None = None):
+    chunks = pipe_chunks(stream, released) if released else iter(lambda: stream.read(65536), b"")
+    pending, oversize = b"", False
+    for chunk in chunks:
+        pending += chunk
+        while True:
+            end = pending.find(b"\n")
+            if end < 0:
+                # Bound line buffers even if an upstream diagnostic has no newline.
+                if len(pending) >= 512:
+                    pending, oversize = b"", True
+                break
+            line, pending = pending[:end + 1], pending[end + 1:]
+            if oversize or len(line) > 512:
+                oversize = False  # The tail of an over-long line is dropped with it.
+                continue
+            event = parse_event(line)
+            if event:
+                yield event
 
 
 def stop_child(child: subprocess.Popen, timeout: float = 3.0) -> None:
@@ -429,16 +453,27 @@ def stop_child(child: subprocess.Popen, timeout: float = 3.0) -> None:
         pass
 
 
-def reap_group_after_exit(child: subprocess.Popen) -> None:
-    # The event loop ends on stderr EOF. A process the session started can hold that pipe
-    # open after the session itself has exited, which would block the loop for good.
+def reap_group_after_exit(child: subprocess.Popen, released: threading.Event, finished: threading.Event) -> None:
+    # The event loop ends on stderr EOF. A process the session started can hold that pipe open
+    # after the session itself has exited. Members of its process group are ended after a grace
+    # period; one that left the group cannot be signalled, so the loop is released instead.
     child.wait()
+    deadline = time.monotonic() + GROUP_GRACE
     try:
-        os.killpg(child.pid, 0)  # Members remain, so the group ID stays reserved for them.
-        time.sleep(GROUP_GRACE)
-        os.killpg(child.pid, signal.SIGKILL)
+        while not finished.is_set():
+            # The group ID stays reserved only while members exist, so check right before use.
+            os.killpg(child.pid, 0)
+            if time.monotonic() >= deadline:
+                os.killpg(child.pid, signal.SIGKILL)
+                break
+            finished.wait(0.05)
     except (ProcessLookupError, PermissionError):
         pass
+    if not finished.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            finished.wait(remaining)
+    released.set()
 
 
 def verified_binary(manifest_path: Path) -> tuple[Path, dict]:
@@ -527,8 +562,12 @@ def run(args) -> int:
             stopping = True
             raise KeyboardInterrupt
     # SIGHUP: closing the terminal or losing an SSH connection must also end the session.
-    previous = {number: signal.signal(number, interrupted)
-                for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    # An ignored SIGHUP (nohup) is the user's request to survive a hangup and is left alone.
+    handled = [signal.SIGINT, signal.SIGTERM]
+    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+        handled.append(signal.SIGHUP)
+    previous = {number: signal.signal(number, interrupted) for number in handled}
+    released, finished = threading.Event(), threading.Event()
     try:
         fd = os.open(directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as output:
@@ -536,8 +575,9 @@ def run(args) -> int:
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                      start_new_session=True)
             print(f"Session process: {child.pid}", flush=True)
-            threading.Thread(target=reap_group_after_exit, args=(child,), daemon=True).start()
-            for event in events(child.stderr):
+            threading.Thread(target=reap_group_after_exit, args=(child, released, finished),
+                             daemon=True).start()
+            for event in events(child.stderr, released):
                 if event["type"] == "driver":
                     driver = event["driver"]
                 # Bounded evidence storage; continue draining after the cap.
@@ -560,7 +600,11 @@ def run(args) -> int:
                     # A signal can still raise until this assignment, so nothing below it is
                     # ever interrupted half way; the retry then runs the cleanup once.
                     stopping = True
+                    finished.set()
                     if child:
+                        if ended == "interrupted" and child.poll() is not None:
+                            # The session had already ended by itself; keep its own status.
+                            ended, exit_code = "session-exit", child.returncode
                         stop_child(child)
                         if child.stderr:
                             child.stderr.close()
@@ -575,8 +619,11 @@ def run(args) -> int:
             for number, handler in previous.items():
                 if handler is not None:  # None: installed outside Python, cannot be reinstated.
                     signal.signal(number, handler)
-    print(f"Disconnected ({ended}, exit={exit_code}, driver={driver}, events={count}). "
-          "No compatibility verdict was inferred.")
+    try:
+        print(f"Disconnected ({ended}, exit={exit_code}, driver={driver}, events={count}). "
+              "No compatibility verdict was inferred.")
+    except OSError:
+        pass  # The terminal is gone after a hangup; the record is already written.
     if ended == "interrupted":
         return 130
     return 0 if exit_code == 0 else 1

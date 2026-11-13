@@ -309,6 +309,34 @@ class IsolationTests(unittest.TestCase):
         finally:
             for child in children: probe.stop_child(child, timeout=0.1)
 
+    def test_group_members_are_ended_after_the_leader_has_exited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "member.pid"
+            leader = subprocess.Popen([sys.executable, "-c",
+                "import subprocess, sys\n"
+                "member = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+                "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                f"open({str(record)!r}, 'w').write(str(member.pid))\n"], start_new_session=True)
+            leader.wait()
+            member = int(record.read_text())
+            try:
+                os.kill(member, 0)  # still running, and the leader is gone
+                probe.stop_child(leader, timeout=0.1)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(member, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("a member of the session's group survived stop_child")
+            finally:
+                try:
+                    os.kill(member, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
 
 class ProvenanceTests(unittest.TestCase):
     def test_patch_lock_matches(self):
@@ -700,8 +728,9 @@ class LaunchTests(unittest.TestCase):
                 os.kill(os.getpid(), signal.SIGHUP)
             sender = threading.Thread(target=hang_up)
             before = signal.getsignal(signal.SIGHUP)
-            # Without a handler the default action would end the test process itself.
-            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            # Without a handler the default action would end the test process itself. An ignored
+            # SIGHUP is left alone by run(), so this must be a handler and not SIG_IGN.
+            signal.signal(signal.SIGHUP, lambda number, frame: None)
             try:
                 with patch.object(probe, "doctor", return_value={"target_ready": True}), \
                      patch.object(probe, "verified_binary", return_value=(executable,
@@ -716,6 +745,63 @@ class LaunchTests(unittest.TestCase):
                 sender.join()
                 signal.signal(signal.SIGHUP, before)
                 for child in children: probe.stop_child(child, timeout=0.1)
+
+    def test_ignored_hangup_stays_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "quick"
+            executable.write_text(f"#!{sys.executable}\nimport sys\n"
+                                  "print('WAYWIN_PROBE_V1 driver=wayland', file=sys.stderr)\n")
+            executable.chmod(0o700)
+            args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
+                             label="host-a", mode="rail", app="||probe", output=root / "runs",
+                             display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
+            before = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            installed = []
+            original = signal.signal
+            def spy(number, handler):
+                installed.append(number)
+                return original(number, handler)
+            try:
+                with patch.object(probe, "doctor", return_value={"target_ready": True}), \
+                     patch.object(probe, "verified_binary", return_value=(executable,
+                             {"system": "Linux", "native_wayland_helpers": True})), \
+                     patch.object(probe.signal, "signal", side_effect=spy), \
+                     patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(probe.run(args), 0)
+                self.assertNotIn(signal.SIGHUP, installed)
+                self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
+            finally:
+                signal.signal(signal.SIGHUP, before)
+
+    def test_detached_process_holding_the_pipe_does_not_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "leaves-a-detached-process"
+            executable.write_text(f"#!{sys.executable}\nimport subprocess, sys\n"
+                "other = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+                "                         start_new_session=True)\n"
+                f"open({str(root / 'other.pid')!r}, 'w').write(str(other.pid))\n"
+                "print('WAYWIN_PROBE_V1 driver=wayland', file=sys.stderr, flush=True)\n"
+                "sys.exit(7)\n")
+            executable.chmod(0o700)
+            args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
+                             label="host-a", mode="rail", app="||probe", output=root / "runs",
+                             display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
+            try:
+                with patch.object(probe, "doctor", return_value={"target_ready": True}), \
+                     patch.object(probe, "verified_binary", return_value=(executable,
+                             {"system": "Linux", "native_wayland_helpers": True})), \
+                     patch.object(probe, "GROUP_GRACE", 0.2), \
+                     patch("sys.stdout", new_callable=io.StringIO):
+                    start = time.monotonic()
+                    self.assertEqual(probe.run(args), 1)
+                    self.assertLess(time.monotonic() - start, 20)
+                record = json.loads(next(args.output.glob("*/exit.json")).read_text())
+                self.assertEqual((record["ended"], record["exit_code"], record["events_seen"]), ("session-exit", 7, 1))
+            finally:
+                # It left the session's group on purpose, so the tool cannot and does not end it.
+                os.kill(int((root / "other.pid").read_text()), signal.SIGKILL)
 
     def test_leftover_process_cannot_hold_the_run_open(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -779,6 +865,15 @@ class LaunchTests(unittest.TestCase):
                  patch("sys.stdout", new_callable=io.StringIO):
                 self.assertEqual(probe.run(args), 1)
             run = next(args.output.iterdir())
+            with patch.object(probe, "doctor", return_value={"target_ready": True}), \
+                 patch.object(probe, "verified_binary", return_value=(executable,
+                         {"system": "Linux", "native_wayland_helpers": True})), \
+                 patch.object(probe, "EVENT_LIMIT", 5), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                probe.run(args)
+            exact = next(path for path in args.output.iterdir() if path != run)
+            self.assertFalse(json.loads((exact / "exit.json").read_text())["events_truncated"])
+            self.assertEqual(len((exact / "events.jsonl").read_text().splitlines()), 5)
             stored = [json.loads(line) for line in (run / "events.jsonl").read_text().splitlines()]
             self.assertEqual([item["window"] for item in stored], [1, 2, 3])
             self.assertEqual(json.loads((run / "exit.json").read_text()), {
