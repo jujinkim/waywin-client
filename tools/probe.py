@@ -202,6 +202,25 @@ def dependency_inventory(cache: str) -> dict:
     return result
 
 
+def runtime_libraries(build_dir: Path) -> dict:
+    """SHA-256 of every shared library in the build tree, keyed by relative path.
+
+    The executable is a thin front end; protocol, TLS and certificate code is in these files.
+    """
+    root = build_dir.resolve()
+    result = {}
+    for path in sorted(build_dir.rglob("*")):
+        if "CMakeFiles" in path.parts or not re.search(r"\.(?:so(?:\.[0-9]+)*|dylib)$", path.name):
+            continue
+        if path.is_symlink():
+            # Version links are expected, but only to files that are hashed here.
+            if not path.resolve().is_relative_to(root):
+                raise ProbeError("A library link in the build tree points outside it")
+        elif path.is_file():
+            result[path.relative_to(build_dir).as_posix()] = sha256(path)
+    return result
+
+
 def build(jobs: int) -> None:
     prepare()
     BUILD.mkdir(parents=True, exist_ok=True)
@@ -224,9 +243,10 @@ def build(jobs: int) -> None:
         raise ProbeError("SDL native Wayland helpers missing; install wayland-client/scanner/protocols")
     cache = (BUILD / "CMakeCache.txt").read_text(encoding="utf-8")
     private_json(manifest, {
-        "schema": 1, "source_commit": lock()["freerdp"]["commit"],
+        "schema": 2, "source_commit": lock()["freerdp"]["commit"],
         "patch_sha256": sha256(PATCH), "profile_sha256": sha256(PROFILE),
         "binary": str(binary.relative_to(BUILD)), "binary_sha256": sha256(binary),
+        "libraries": runtime_libraries(BUILD),
         "version": version, "system": platform.system(), "machine": platform.machine(),
         "native_wayland_helpers": native, "dependency_versions": dependency_inventory(cache),
         "cache_sha256": sha256(BUILD / "CMakeCache.txt"),
@@ -422,12 +442,22 @@ def verified_binary(manifest_path: Path) -> tuple[Path, dict]:
         raise ProbeError("Build manifest missing or unreadable; run build first") from None
     if not isinstance(manifest, dict):
         raise ProbeError("Build manifest missing or unreadable; run build first")
-    binary = (manifest_path.parent / manifest["binary"]).resolve()
-    if (manifest.get("schema") != 1 or manifest.get("source_commit") != lock()["freerdp"]["commit"]
+    # These checks detect a stale or altered build next to its manifest. The manifest itself is
+    # not authenticated, so they are not proof of where the build came from.
+    stale = ProbeError("Build provenance does not match; rebuild with this checkout")
+    directory = manifest_path.parent
+    name = manifest.get("binary")
+    if manifest.get("schema") != 2 or not isinstance(name, str):
+        raise stale
+    binary = (directory / name).resolve()
+    if not binary.is_relative_to(directory.resolve()) or not binary.is_file():
+        raise stale
+    if (manifest.get("source_commit") != lock()["freerdp"]["commit"]
             or manifest.get("patch_sha256") != sha256(PATCH)
             or manifest.get("profile_sha256") != sha256(PROFILE)
-            or manifest.get("binary_sha256") != sha256(binary)):
-        raise ProbeError("Build provenance does not match; rebuild with this checkout")
+            or manifest.get("binary_sha256") != sha256(binary)
+            or manifest.get("libraries") != runtime_libraries(directory)):
+        raise stale
     return binary, manifest
 
 

@@ -337,18 +337,74 @@ class ProvenanceTests(unittest.TestCase):
             with patch.object(probe, "SOURCE", source), patch.dict(os.environ, {**clean, **hostile}):
                 self.assertEqual(probe.source_diff(), approved)
 
+    def manifest(self, directory):
+        (directory / "bin").mkdir()
+        (directory / "lib").mkdir()
+        binary = directory / "bin" / "client"
+        binary.write_bytes(b"synthetic binary")
+        library = directory / "lib" / "libfreerdp3.so.3.33.1"
+        library.write_bytes(b"synthetic library")
+        (directory / "lib" / "libfreerdp3.so.3").symlink_to("libfreerdp3.so.3.33.1")
+        (directory / "lib" / "libwinpr3.3.33.1.dylib").write_bytes(b"other library")
+        (directory / "CMakeFiles").mkdir()
+        (directory / "CMakeFiles" / "probe.so").write_bytes(b"configure check, not a product")
+        data = {"schema": 2, "binary": "bin/client", "binary_sha256": probe.sha256(binary),
+                "libraries": probe.runtime_libraries(directory),
+                "source_commit": probe.lock()["freerdp"]["commit"],
+                "patch_sha256": probe.sha256(probe.PATCH), "profile_sha256": probe.sha256(probe.PROFILE)}
+        path = directory / "build-manifest.json"
+        path.write_text(json.dumps(data))
+        return path, data, binary, library
+
+    def test_matching_build_is_accepted_and_libraries_are_listed(self):
+        with tempfile.TemporaryDirectory() as name:
+            path, data, binary, _ = self.manifest(Path(name).resolve())
+            self.assertEqual(sorted(data["libraries"]), ["lib/libfreerdp3.so.3.33.1", "lib/libwinpr3.3.33.1.dylib"])
+            self.assertEqual(probe.verified_binary(path)[0], binary)
+
     def test_binary_tampering_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            binary = Path(directory) / "binary"
-            binary.write_bytes(b"synthetic binary")
-            data = {"schema": 1, "binary": "binary", "binary_sha256": probe.sha256(binary),
-                    "source_commit": probe.lock()["freerdp"]["commit"],
-                    "patch_sha256": probe.sha256(probe.PATCH), "profile_sha256": probe.sha256(probe.PROFILE)}
-            manifest = Path(directory) / "build-manifest.json"
-            manifest.write_text(json.dumps(data))
-            self.assertEqual(probe.verified_binary(manifest)[0], binary.resolve())
+        with tempfile.TemporaryDirectory() as name:
+            path, _, binary, _ = self.manifest(Path(name).resolve())
             binary.write_bytes(b"changed binary")
-            with self.assertRaises(probe.ProbeError): probe.verified_binary(manifest)
+            with self.assertRaises(probe.ProbeError): probe.verified_binary(path)
+
+    def test_library_changes_are_rejected(self):
+        def modified(directory, library): library.write_bytes(b"changed library")
+        def added(directory, library): (directory / "lib" / "libextra.so").write_bytes(b"x")
+        def removed(directory, library): library.unlink()
+        def redirected(directory, library):
+            outside = directory.parent / (directory.name + "-outside.so")
+            outside.write_bytes(b"synthetic library")
+            self.addCleanup(outside.unlink)
+            (directory / "lib" / "libfreerdp3.so.3").unlink()
+            (directory / "lib" / "libfreerdp3.so.3").symlink_to(outside)
+        for change in (modified, added, removed, redirected):
+            with self.subTest(change=change.__name__), tempfile.TemporaryDirectory() as name:
+                directory = Path(name).resolve()
+                path, _, _, library = self.manifest(directory)
+                change(directory, library)
+                with self.assertRaises(probe.ProbeError): probe.verified_binary(path)
+
+    def test_stale_or_malformed_manifest_is_rejected(self):
+        changes = ({"schema": 1}, {"source_commit": "0" * 40}, {"patch_sha256": "0" * 64},
+                   {"profile_sha256": "0" * 64}, {"binary": "../outside"}, {"binary": 7}, {"libraries": None})
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as name:
+                directory = Path(name).resolve()
+                path, data, binary, _ = self.manifest(directory)
+                if change.get("binary") == "../outside":
+                    outside = directory.parent / "outside"
+                    outside.write_bytes(binary.read_bytes())
+                    self.addCleanup(outside.unlink)
+                path.write_text(json.dumps({**data, **change}))
+                with self.assertRaises(probe.ProbeError): probe.verified_binary(path)
+        with tempfile.TemporaryDirectory() as name:
+            for content in (None, "not json", "[]"):
+                path = Path(name) / "build-manifest.json"
+                if content is not None: path.write_text(content)
+                with self.subTest(content=content), self.assertRaises(probe.ProbeError) as raised:
+                    probe.verified_binary(path)
+                self.assertIn("run build first", str(raised.exception))
 
 
 class PrepareTests(unittest.TestCase):
