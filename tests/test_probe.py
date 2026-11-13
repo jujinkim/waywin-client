@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from argparse import Namespace
@@ -307,6 +308,52 @@ class LaunchTests(unittest.TestCase):
                 with self.assertRaises(probe.ProbeError): probe.run(args)
             self.assertEqual(len(children), 1)
             self.assertIsNotNone(children[0].poll())
+
+    def test_repeated_interrupt_still_kills_child_and_records_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "ignores-sigterm"
+            executable.write_text(f"#!{sys.executable}\nimport signal, sys, time\n"
+                                  "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                                  "print('WAYWIN_PROBE_V1 driver=wayland', file=sys.stderr, flush=True)\n"
+                                  "time.sleep(60)\n")
+            executable.chmod(0o700)
+            args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
+                             label="host-a", mode="rail", app="||probe", output=root / "runs",
+                             display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
+            children = []
+            original_popen, original_stop = subprocess.Popen, probe.stop_child
+            def spawn(*argv, **kwargs):
+                child = original_popen(*argv, **kwargs)
+                children.append(child)
+                return child
+            def interrupt_twice():
+                # The first event proves the child ignores SIGTERM and run() is inside its try block.
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not any(
+                        path.stat().st_size for path in args.output.glob("*/events.jsonl")):
+                    time.sleep(0.02)
+                os.kill(os.getpid(), signal.SIGINT)
+                time.sleep(0.3)  # Inside stop_child's grace period.
+                os.kill(os.getpid(), signal.SIGINT)
+            sender = threading.Thread(target=interrupt_twice)
+            try:
+                with patch.object(probe, "doctor", return_value={"target_ready": True}), \
+                     patch.object(probe, "verified_binary", return_value=(executable,
+                             {"system": "Linux", "native_wayland_helpers": True})), \
+                     patch.object(probe.subprocess, "Popen", side_effect=spawn), \
+                     patch.object(probe, "stop_child", side_effect=lambda child: original_stop(child, timeout=1.0)), \
+                     patch("sys.stdout", new_callable=io.StringIO):
+                    sender.start()
+                    self.assertEqual(probe.run(args), 1)
+                sender.join()
+                self.assertIsNotNone(children[0].poll())
+                record = json.loads(next(args.output.glob("*/exit.json")).read_text())
+                self.assertEqual(record["exit_code"], 130)
+                self.assertEqual(record["events_seen"], 1)
+            finally:
+                sender.join()
+                for child in children: original_stop(child, timeout=0.1)
 
     def test_end_to_end_evidence_discards_raw_logs_and_separates_runs(self):
         with tempfile.TemporaryDirectory() as directory:

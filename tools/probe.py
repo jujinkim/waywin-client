@@ -400,13 +400,20 @@ def run(args) -> int:
     except KeyboardInterrupt:
         exit_code = 130
     finally:
-        signal.signal(signal.SIGTERM, previous_term)
-        if child:
-            stop_child(child)
-            if child.stderr:
-                child.stderr.close()
-        private_json(directory / "exit.json", {"exit_code": exit_code, "events_seen": count,
-                     "events_truncated": count > 100000, "runtime_verified": False})
+        # Cleanup is bounded by stop_child. A second Ctrl-C or SIGTERM here must not skip the
+        # forced kill or exit.json, so both are ignored until it is done.
+        previous_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            if child:
+                stop_child(child)
+                if child.stderr:
+                    child.stderr.close()
+            private_json(directory / "exit.json", {"exit_code": exit_code, "events_seen": count,
+                         "events_truncated": count > 100000, "runtime_verified": False})
+        finally:
+            signal.signal(signal.SIGINT, previous_int)
+            signal.signal(signal.SIGTERM, previous_term)
     print(f"Disconnected (exit={exit_code}, events={count}). No compatibility verdict was inferred.")
     return 0 if exit_code == 0 else 1
 
