@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import stat
@@ -346,6 +347,26 @@ class IsolationTests(unittest.TestCase):
 class ProvenanceTests(unittest.TestCase):
     def test_patch_lock_matches(self):
         self.assertEqual(probe.sha256(probe.PATCH), probe.lock()["freerdp"]["probe_patch_sha256"])
+
+    def test_patch_observes_the_driver_once_for_every_session_mode(self):
+        text = probe.PATCH.read_text(encoding="utf-8")
+        files = re.findall(r"^diff --git a/(\S+) b/\1$", text, re.MULTILINE)
+        self.assertEqual(files, ["client/SDL/SDL3/sdl_freerdp.cpp", "client/SDL/SDL3/sdl_rail.cpp"])
+        sections = dict(zip(files, re.split(r"^diff --git .*$", text, flags=re.MULTILINE)[1:]))
+        added = {name: [line[1:] for line in body.splitlines()
+                        if line.startswith("+") and not line.startswith("+++")]
+                 for name, body in sections.items()}
+        # Emitted right after SDL_Init in main(), before any connection, so desktop runs are
+        # observed too; RAIL initialisation no longer repeats it.
+        driver = [line for lines in added.values() for line in lines if "driver=" in line]
+        self.assertEqual(len(driver), 1)
+        self.assertIn("backend ? backend : \"\"", driver[0])
+        self.assertTrue(any("driver=" in line for line in added["client/SDL/SDL3/sdl_freerdp.cpp"]))
+        # Both observers stay behind the same opt-in variable and never print without it.
+        for name, lines in added.items():
+            with self.subTest(file=name):
+                self.assertIn('WAYWIN_PROBE_EVENTS', "\n".join(lines))
+                self.assertIn('"1"', "\n".join(lines))
 
     def test_patch_comparison_ignores_user_git_settings(self):
         with tempfile.TemporaryDirectory() as directory:

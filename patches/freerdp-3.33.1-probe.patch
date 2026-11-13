@@ -1,5 +1,30 @@
+diff --git a/client/SDL/SDL3/sdl_freerdp.cpp b/client/SDL/SDL3/sdl_freerdp.cpp
+index f3eb055..88a5290 100644
+--- a/client/SDL/SDL3/sdl_freerdp.cpp
++++ b/client/SDL/SDL3/sdl_freerdp.cpp
+@@ -31,6 +31,7 @@
+ 
+ #include <cerrno>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #if defined(__cpp_lib_source_location) && (__cpp_lib_source_location >= 201907L)
+@@ -724,6 +725,12 @@ int main(int argc, char* argv[])
+ 
+ 	auto backend = SDL_GetCurrentVideoDriver();
+ 	WLog_Print(sdl->getWLog(), WLOG_DEBUG, "client is using backend '%s'", backend);
++	/* WayWin stage-0 observer: the video driver name only, for desktop and RAIL sessions. */
++	{
++		const char* waywinProbe = std::getenv("WAYWIN_PROBE_EVENTS");
++		if (waywinProbe && (std::strcmp(waywinProbe, "1") == 0))
++			std::fprintf(stderr, "WAYWIN_PROBE_V1 driver=%s\n", backend ? backend : "");
++	}
+ 	sdl_dialogs_init();
+ 
+ 	/* SDL cleanup code if the client exits */
 diff --git a/client/SDL/SDL3/sdl_rail.cpp b/client/SDL/SDL3/sdl_rail.cpp
-index 1a927e3..ef1516f 100644
+index 1a927e3..471c162 100644
 --- a/client/SDL/SDL3/sdl_rail.cpp
 +++ b/client/SDL/SDL3/sdl_rail.cpp
 @@ -17,6 +17,9 @@
@@ -38,16 +63,7 @@ index 1a927e3..ef1516f 100644
  /* The compositor runs the drag (Wayland); the client only tracks the size. */
  [[nodiscard]] static bool compositorDrag()
  {
-@@ -854,6 +876,8 @@ bool SdlRail::init(RailClientContext* rail)
- 	/* Keep default ServerHandshake. */
- 
- 	WLog_WARN(TAG, "RemoteApp/RAIL support in the SDL client is experimental");
-+	if (waywinProbeEnabled())
-+		std::fprintf(stderr, "WAYWIN_PROBE_V1 driver=%s\n", SDL_GetCurrentVideoDriver());
- 	{
- 		std::unique_lock lock(_windowsLock);
- 		updateCoordinates();
-@@ -942,6 +966,23 @@ void SdlRail::registerUpdateCallbacks(rdpUpdate* update)
+@@ -942,6 +964,23 @@ void SdlRail::registerUpdateCallbacks(rdpUpdate* update)
  	window->WindowDelete = SdlRail::window_delete;
  	window->MonitoredDesktop = SdlRail::monitored_desktop;
  	window->NonMonitoredDesktop = SdlRail::non_monitored_desktop;
@@ -71,7 +87,7 @@ index 1a927e3..ef1516f 100644
  }
  
  /* --- server callbacks --- */
-@@ -1724,6 +1765,8 @@ BOOL SdlRail::window_common(rdpContext* context, const WINDOW_ORDER_INFO* orderI
+@@ -1724,6 +1763,8 @@ BOOL SdlRail::window_common(rdpContext* context, const WINDOW_ORDER_INFO* orderI
                              const WINDOW_STATE_ORDER* windowState)
  {
  	WINPR_ASSERT(orderInfo);
@@ -80,7 +96,7 @@ index 1a927e3..ef1516f 100644
  	WINPR_ASSERT(windowState);
  	auto rail = SdlRail::get(context);
  	if (!rail)
-@@ -1932,6 +1975,7 @@ BOOL SdlRail::window_cached_icon(rdpContext* context, const WINDOW_ORDER_INFO* o
+@@ -1932,6 +1973,7 @@ BOOL SdlRail::window_cached_icon(rdpContext* context, const WINDOW_ORDER_INFO* o
  BOOL SdlRail::window_delete(rdpContext* context, const WINDOW_ORDER_INFO* orderInfo)
  {
  	WINPR_ASSERT(orderInfo);
@@ -88,7 +104,7 @@ index 1a927e3..ef1516f 100644
  	auto rail = SdlRail::get(context);
  	if (!rail)
  		return FALSE;
-@@ -1969,6 +2013,7 @@ BOOL SdlRail::monitored_desktop(rdpContext* context, const WINDOW_ORDER_INFO* or
+@@ -1969,6 +2011,7 @@ BOOL SdlRail::monitored_desktop(rdpContext* context, const WINDOW_ORDER_INFO* or
  	/* Launch the RemoteApp on DESKTOP_ARC_COMPLETED, like xf_rail_monitored_desktop. */
  	if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_DESKTOP_ARC_COMPLETED)
  	{
@@ -96,7 +112,7 @@ index 1a927e3..ef1516f 100644
  		rail->enableRemoteAppMode(true);
  		const char* app =
  		    freerdp_settings_get_string(context->settings, FreeRDP_RemoteApplicationProgram);
-@@ -2017,6 +2062,7 @@ BOOL SdlRail::non_monitored_desktop(rdpContext* context,
+@@ -2017,6 +2060,7 @@ BOOL SdlRail::non_monitored_desktop(rdpContext* context,
  	auto rail = SdlRail::get(context);
  	if (rail)
  	{

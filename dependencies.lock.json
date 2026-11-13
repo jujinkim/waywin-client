@@ -5,7 +5,7 @@
     "tag": "3.33.1",
     "commit": "65bcca1913a28cbdd7eb913599f692bd2b707991",
     "license": "Apache-2.0",
-    "probe_patch_sha256": "cb6743f35bd89b7e3538b7e5d2caa50527b52b86ad307769f55dafe69a8a333a"
+    "probe_patch_sha256": "839bad68c19b57ba87a18672f883ea0425e2db5d887a26cfebbf6ec368626c02"
   },
   "system_dependencies": "Exact resolved versions are recorded per build in build-manifest.json; see docs/validation.md. This is not a hermetic distribution lock."
 }

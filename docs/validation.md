@@ -5,7 +5,7 @@
 ## 구성과 변경 범위
 
 - `tools/probe.py`: 소스 검증·빌드, 환경 점검, 호스트별 별도 SDL3 프로세스 실행, 제한된 이벤트 수집, 수동 결과 기록 검사. Python 3.10 이상, 표준 라이브러리만 사용한다.
-- `patches/freerdp-3.33.1-probe.patch`: SDL3 `sdl_rail.cpp` 하나에만 관측 코드를 추가한다. `WAYWIN_PROBE_EVENTS=1`일 때만 동작한다. 창 생성/삭제, 알림 아이콘 생성/변경/삭제, 모니터링 전환, SDL 드라이버를 기록한다. **트레이 렌더링이나 클릭 전달은 구현하지 않는다.**
+- `patches/freerdp-3.33.1-probe.patch`: SDL3 클라이언트의 두 파일에 관측 코드만 추가한다. `WAYWIN_PROBE_EVENTS=1`일 때만 동작한다. `sdl_rail.cpp`는 창 생성/삭제, 알림 아이콘 생성/변경/삭제, 모니터링 전환을, `sdl_freerdp.cpp`는 `SDL_Init` 직후 선택된 SDL 드라이버 이름 한 줄을 기록한다. **트레이 렌더링이나 클릭 전달은 구현하지 않는다.**
 - `windows/probe`: 네이티브 Win32 GUI 시험 앱. 세션 ID·PID·인스턴스 UUID·경과 시간·세션 화면 수/가상 영역·DPI, 편집 가능한 임시 텍스트, 문서 창 생성/지연 생성/최소화/복원/크기 변경, 모달 팝업, 트레이 생성/변경/삭제/클릭/메뉴, Notepad와 실제 셸 UI 열기를 제공한다. 네트워크 수신·자동 시스템 설정 변경·키 입력 기록을 하지 않는다. 조작은 메뉴바의 Documents / Tray / Windows shell에 있다.
 - `cmake/FreeRDPProbe.cmake`: 시험용 빌드 프로필. 영상 최적화·Kerberos·장치 공유 기능 일부를 끈 기본 경로이다. 이 프로필로 최종 성능·도메인 인증·음성 기능을 평가하지 않는다. H.264 복호기가 없고 그래픽 옵션을 지정하지 않으므로 기획의 1080p·30fps 측정 목표는 이 빌드로 측정할 수 없다. 컴파일러 보호 옵션(스택 보호·FORTIFY 등)은 프로필이 지정하지 않으며 배포판 툴체인 기본값을 따른다.
 
@@ -105,7 +105,7 @@ python3 tools/probe.py run --server windows.example --user alice --label host-a 
 
 `run`은 빌드 명세(`build-manifest.json`)의 실행파일과 빌드 디렉터리의 모든 공유 라이브러리 해시가 현재 파일과 일치할 때만 실행한다. 명세 자체는 서명되지 않으므로 이는 오래되거나 바뀐 빌드를 걸러내는 검사이며 출처 증명이 아니다.
 
-`out/runs/<UUID>/run.json`, `events.jsonl`, `exit.json`은 로컬 증거이다. 파일 0600, 실행 디렉터리 0700, 이벤트 최대 100,000개이며 상한 도달은 `events_truncated`로 기록한다. 일반 로그를 수집하지 않는다. 데이터는 자동 업로드하지 않고 `.gitignore`에서 제외한다. 로그 수신은 실제 화면·입력 성공 증거가 아니다. `exit.json`의 `ended`는 세션이 스스로 끝났는지(`session-exit`), 사용자가 중단했는지(`interrupted`), 도구가 중단했는지(`aborted`)를 구분하고, `exit_code`는 세션이 스스로 끝난 경우에만 채운다. 중단한 실행의 도구 종료 코드는 130이다. `sdl_driver_observed`가 `wayland`인지 RAIL 실행에서 확인한다. 목록에 없는 드라이버는 `unknown`으로 기록하고 실행을 중단한다. 데스크톱 전용 실행은 RAIL 초기화가 없어 드라이버 관측 이벤트가 없으며 이 값은 `null`이다. 보고서의 `sdl_driver`는 이 관측값이 있는 실행을 근거로 적는다.
+`out/runs/<UUID>/run.json`, `events.jsonl`, `exit.json`은 로컬 증거이다. 파일 0600, 실행 디렉터리 0700, 이벤트 최대 100,000개이며 상한 도달은 `events_truncated`로 기록한다. 일반 로그를 수집하지 않는다. 데이터는 자동 업로드하지 않고 `.gitignore`에서 제외한다. 로그 수신은 실제 화면·입력 성공 증거가 아니다. `exit.json`의 `ended`는 세션이 스스로 끝났는지(`session-exit`), 사용자가 중단했는지(`interrupted`), 도구가 중단했는지(`aborted`)를 구분하고, `exit_code`는 세션이 스스로 끝난 경우에만 채운다. 중단한 실행의 도구 종료 코드는 130이다. `sdl_driver_observed`가 `wayland`인지 확인한다. 드라이버는 데스크톱·RAIL 모두 SDL 초기화 직후, 서버 접속 전에 한 번 기록된다. 목록에 없는 드라이버는 `unknown`으로 기록하고 실행을 중단한다. 값이 `null`이면 클라이언트가 SDL 초기화 전에 끝난 것(인자 오류, SDL 초기화 실패 등)이므로 그 실행을 화면 검증의 근거로 쓰지 않는다. 보고서의 `sdl_driver`는 이 관측값이 있는 실행을 근거로 적는다.
 
 ## GUI 검증 항목과 종료 조건
 

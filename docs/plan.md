@@ -160,7 +160,7 @@ stateDiagram-v2
 
 SDL3 빌드에는 Wayland 네이티브 move/resize 보조 경로가 있으나 의존성이 없으면 stub으로 빌드될 수 있다. 검증 빌드는 Linux에서 `WITH_SDL_WAYLAND_NATIVE`가 실제 컴파일 옵션에 있는지 확인한다. 이는 GNOME 동작 검증을 대체하지 않는다. [빌드 소스](https://github.com/FreeRDP/FreeRDP/blob/65bcca1913a28cbdd7eb913599f692bd2b707991/client/SDL/SDL3/CMakeLists.txt)
 
-현재 수정은 수신 이벤트의 종류/숫자 ID만 관측하는 단일 파일 패치이다. 기존 FreeRDP 인증·RDP 통신·영상·창 처리를 유지하고 실행 도구에서 별도 프로세스로 호출한다. 제품의 IPC·트레이·호스트 표시 수정 범위는 실환경 증거 후 결정한다. 모니터링/비모니터링 데스크톱 콜백이 있다는 사실만으로 사용자 모드 전환과 작업 보존을 지원한다고 결론 내리지 않는다.
+현재 수정은 수신 이벤트의 종류/숫자 ID와 SDL 드라이버 이름만 관측하는 패치이다(`sdl_rail.cpp`의 RAIL 이벤트, `sdl_freerdp.cpp`의 드라이버 한 줄). 기존 FreeRDP 인증·RDP 통신·영상·창 처리를 유지하고 실행 도구에서 별도 프로세스로 호출한다. 제품의 IPC·트레이·호스트 표시 수정 범위는 실환경 증거 후 결정한다. 모니터링/비모니터링 데스크톱 콜백이 있다는 사실만으로 사용자 모드 전환과 작업 보존을 지원한다고 결론 내리지 않는다.
 
 Windows 시험 앱은 [Shell_NotifyIconW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw)의 생성/수정/삭제·버전 4 콜백과 [ProcessIdToSessionId](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-processidtosessionid)를 사용한다. DPI는 [Microsoft 권고](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setprocessdpiawarenesscontext)에 따라 manifest에서 PerMonitorV2로 선언한다. 실제 Windows GUI 동작은 아직 미검증이다.
 
