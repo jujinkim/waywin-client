@@ -133,8 +133,17 @@ class EventTests(unittest.TestCase):
         for line in (b"password=secret\n", b"DEBUG title=secret\n", b"\xff\n",
                      b"WAYWIN_PROBE_V1 type=notify-update window=1 icon=2 flags=3 title=secret\n",
                      b"WAYWIN_PROBE_V1 type=notify-update window=4294967296 icon=2 flags=3\n",
-                     b"WAYWIN_PROBE_V1 driver=secret\n", b"prefix WAYWIN_PROBE_V1 driver=wayland\n"):
+                     b"prefix WAYWIN_PROBE_V1 driver=wayland\n"):
             with self.subTest(line=line): self.assertIsNone(probe.parse_event(line))
+
+    def test_unrecognised_driver_is_reported_without_its_text(self):
+        for name in (b"secret", b"kmsdrm", b"(null)", b"", b"\xff"):
+            with self.subTest(name=name):
+                self.assertEqual(probe.parse_event(b"WAYWIN_PROBE_V1 driver=" + name + b"\n"),
+                                 {"type": "driver", "driver": "unknown"})
+        for event in probe.EVENT_TYPES:
+            line = f"WAYWIN_PROBE_V1 type={event} window=1 icon=2 flags=3\n".encode()
+            self.assertEqual(probe.parse_event(line), {"type": event, "window": 1, "icon": 2, "flags": 3})
 
     def test_oversize_line_cannot_smuggle_valid_tail(self):
         valid = b"WAYWIN_PROBE_V1 driver=wayland\n"
@@ -351,6 +360,11 @@ class LaunchTests(unittest.TestCase):
                 with self.assertRaises(probe.ProbeError): probe.run(args)
             self.assertEqual(len(children), 1)
             self.assertIsNotNone(children[0].poll())
+            run = next(args.output.iterdir())
+            record = json.loads((run / "exit.json").read_text())
+            self.assertEqual((record["ended"], record["exit_code"], record["sdl_driver_observed"]),
+                             ("aborted", None, "x11"))
+            self.assertEqual(json.loads((run / "events.jsonl").read_text())["driver"], "x11")
 
     def test_repeated_interrupt_still_kills_child_and_records_exit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -395,15 +409,16 @@ class LaunchTests(unittest.TestCase):
                      patch("sys.stdout", new_callable=io.StringIO):
                     sender.start()
                     try:
-                        self.assertEqual(probe.run(args), 1)
+                        self.assertEqual(probe.run(args), 130)
                     except KeyboardInterrupt:
                         self.fail("a repeated signal aborted the cleanup")
                 sender.join()
                 self.assertEqual([signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)], handlers)
                 self.assertIsNotNone(children[0].poll())
                 record = json.loads(next(args.output.glob("*/exit.json")).read_text())
-                self.assertEqual(record["exit_code"], 130)
-                self.assertEqual(record["events_seen"], 1)
+                self.assertEqual(record, {"ended": "interrupted", "exit_code": None,
+                                          "sdl_driver_observed": "wayland", "events_seen": 1,
+                                          "events_truncated": False, "runtime_verified": False})
             finally:
                 sender.join()
                 for child in children: original_stop(child, timeout=0.1)
@@ -445,7 +460,35 @@ class LaunchTests(unittest.TestCase):
                 self.assertEqual(run_record["requested_display"], {"mode": "multimon", "monitor_ids": [2, 1],
                     "window_size": None, "dynamic_resolution": True})
                 self.assertNotIn("SECRET-SENTINEL", "".join(p.read_text() for p in run.iterdir()))
+                self.assertEqual(json.loads((run / "exit.json").read_text()), {
+                    "ended": "session-exit", "exit_code": 0, "sdl_driver_observed": "wayland",
+                    "events_seen": 2, "events_truncated": False, "runtime_verified": False})
             self.assertNotEqual(*ids)
+
+    def test_event_cap_and_failed_session_are_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "flood"
+            executable.write_text(f"#!{sys.executable}\nimport sys\n"
+                "for number in range(1, 6):\n"
+                "    print(f'WAYWIN_PROBE_V1 type=window-create window={number} icon=0 flags=1', file=sys.stderr)\n"
+                "sys.exit(7)\n")
+            executable.chmod(0o700)
+            args = Namespace(manifest=root / "manifest", server="example.test", user="alice", domain="",
+                             label="host-a", mode="desktop", app=None, output=root / "runs",
+                             display_mode="auto", monitors=None, size=None, dynamic_resolution=False)
+            with patch.object(probe, "doctor", return_value={"target_ready": True}), \
+                 patch.object(probe, "verified_binary", return_value=(executable,
+                         {"system": "Linux", "native_wayland_helpers": True})), \
+                 patch.object(probe, "EVENT_LIMIT", 3), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(probe.run(args), 1)
+            run = next(args.output.iterdir())
+            stored = [json.loads(line) for line in (run / "events.jsonl").read_text().splitlines()]
+            self.assertEqual([item["window"] for item in stored], [1, 2, 3])
+            self.assertEqual(json.loads((run / "exit.json").read_text()), {
+                "ended": "session-exit", "exit_code": 7, "sdl_driver_observed": None,
+                "events_seen": 5, "events_truncated": True, "runtime_verified": False})
 
 
 if __name__ == "__main__": unittest.main()

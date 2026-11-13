@@ -33,6 +33,8 @@ EVENT_TYPES = ("window-create", "window-delete", "notify-create", "notify-update
 EVENT_PATTERN = re.compile(
     rb"WAYWIN_PROBE_V1 type=(" + b"|".join(t.encode() for t in EVENT_TYPES) +
     rb") window=([0-9]{1,10}) icon=([0-9]{1,10}) flags=([0-9]{1,10})\n")
+DRIVERS = ("wayland", "x11", "cocoa", "windows", "dummy", "offscreen")
+EVENT_LIMIT = 100000
 CASES = {
     "P01": "Native Wayland: display, move, resize, input, popups",
     "P02": "Existing AND new windows discovered; representative app inventory",
@@ -306,8 +308,12 @@ def parse_event(line: bytes) -> dict | None:
         if any(n > 0xFFFFFFFF for n in numbers):
             return None
         return dict(type=match[1].decode("ascii"), window=numbers[0], icon=numbers[1], flags=numbers[2])
-    match = re.fullmatch(rb"WAYWIN_PROBE_V1 driver=(wayland|x11|cocoa|windows|dummy|offscreen)\n", line)
-    return {"type": "driver", "driver": match[1].decode("ascii")} if match else None
+    match = re.fullmatch(rb"WAYWIN_PROBE_V1 driver=([^\n]*)\n", line)
+    if not match:
+        return None
+    # Any other name, including a missing driver, is recorded as "unknown" and never as text.
+    name = match[1].decode("ascii", "replace")
+    return {"type": "driver", "driver": name if name in DRIVERS else "unknown"}
 
 
 def events(stream):
@@ -399,7 +405,9 @@ def run(args) -> int:
     count = 0
     started = time.monotonic()
     child = None
-    exit_code = None
+    exit_code = None  # The session's own status; stays None when this tool ended it.
+    ended = "aborted"
+    driver = None
     stopping = False
     def interrupted(signum, frame):
         # Only the first Ctrl-C or SIGTERM interrupts; later ones must not abort the cleanup.
@@ -416,18 +424,21 @@ def run(args) -> int:
                                      start_new_session=True)
             print(f"Session process: {child.pid}", flush=True)
             for event in events(child.stderr):
-                if event["type"] == "driver" and event["driver"] != "wayland":
-                    raise ProbeError("SDL did not select the native Wayland driver")
+                if event["type"] == "driver":
+                    driver = event["driver"]
                 # Bounded evidence storage; continue draining after the cap.
-                if count < 100000:
+                if count < EVENT_LIMIT:
                     event.update(run_id=run_id, sequence=count + 1,
                                  elapsed_ms=int((time.monotonic() - started) * 1000))
                     output.write(json.dumps(event) + "\n")
                     output.flush()
                 count += 1
+                if driver not in (None, "wayland"):
+                    raise ProbeError("SDL did not select the native Wayland driver")
             exit_code = child.wait()
+            ended = "session-exit"
     except KeyboardInterrupt:
-        exit_code = 130
+        ended = "interrupted"
     finally:
         try:
             while True:
@@ -439,8 +450,10 @@ def run(args) -> int:
                         stop_child(child)
                         if child.stderr:
                             child.stderr.close()
-                    private_json(directory / "exit.json", {"exit_code": exit_code, "events_seen": count,
-                                 "events_truncated": count > 100000, "runtime_verified": False})
+                    private_json(directory / "exit.json", {
+                        "ended": ended, "exit_code": exit_code, "sdl_driver_observed": driver,
+                        "events_seen": count, "events_truncated": count > EVENT_LIMIT,
+                        "runtime_verified": False})
                     break
                 except KeyboardInterrupt:
                     continue
@@ -448,7 +461,10 @@ def run(args) -> int:
             for number, handler in previous.items():
                 if handler is not None:  # None: installed outside Python, cannot be reinstated.
                     signal.signal(number, handler)
-    print(f"Disconnected (exit={exit_code}, events={count}). No compatibility verdict was inferred.")
+    print(f"Disconnected ({ended}, exit={exit_code}, driver={driver}, events={count}). "
+          "No compatibility verdict was inferred.")
+    if ended == "interrupted":
+        return 130
     return 0 if exit_code == 0 else 1
 
 

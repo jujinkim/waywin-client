@@ -99,7 +99,7 @@ python3 tools/probe.py run --server windows.example --user alice --label host-a 
 
 `--dynamic-resolution`은 display-control 변경을 시험하는 명시적 옵션이며 기본은 꺼져 있다. 켜졌다는 것만으로 hotplug 지원을 보장하지 않는다. 특히 새 모니터가 선택 목록에 없는데 세션에 추가되는지, 제거된 모니터의 원격 창을 남은 화면에서 복구할 수 있는지 확인한다. `run.json`의 `requested_display`는 **요청값**이며 Windows 시험 앱의 세션 화면 수/영역 및 디스플레이 설정에서 실제 결과를 대조한다.
 
-`out/runs/<UUID>/run.json`, `events.jsonl`, `exit.json`은 로컬 증거이다. 파일 0600, 실행 디렉터리 0700, 이벤트 최대 100,000개이며 상한 도달은 `events_truncated`로 기록한다. 일반 로그를 수집하지 않는다. 데이터는 자동 업로드하지 않고 `.gitignore`에서 제외한다. 로그 수신은 실제 화면·입력 성공 증거가 아니다. `driver=wayland`를 RAIL 실행에서 확인한다. 데스크톱 전용 실행은 RAIL 초기화가 없어 드라이버 관측 이벤트가 없을 수 있다.
+`out/runs/<UUID>/run.json`, `events.jsonl`, `exit.json`은 로컬 증거이다. 파일 0600, 실행 디렉터리 0700, 이벤트 최대 100,000개이며 상한 도달은 `events_truncated`로 기록한다. 일반 로그를 수집하지 않는다. 데이터는 자동 업로드하지 않고 `.gitignore`에서 제외한다. 로그 수신은 실제 화면·입력 성공 증거가 아니다. `exit.json`의 `ended`는 세션이 스스로 끝났는지(`session-exit`), 사용자가 중단했는지(`interrupted`), 도구가 중단했는지(`aborted`)를 구분하고, `exit_code`는 세션이 스스로 끝난 경우에만 채운다. 중단한 실행의 도구 종료 코드는 130이다. `sdl_driver_observed`가 `wayland`인지 RAIL 실행에서 확인한다. 목록에 없는 드라이버는 `unknown`으로 기록하고 실행을 중단한다. 데스크톱 전용 실행은 RAIL 초기화가 없어 드라이버 관측 이벤트가 없으며 이 값은 `null`이다. 보고서의 `sdl_driver`는 이 관측값이 있는 실행을 근거로 적는다.
 
 ## GUI 검증 항목과 종료 조건
 
