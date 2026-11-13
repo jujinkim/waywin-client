@@ -11,7 +11,11 @@ else()
   target_compile_options(waywin-windows-probe PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
 if(MINGW)
-  target_link_options(waywin-windows-probe PRIVATE -municode -static -static-libgcc -static-libstdc++
-    -Wl,--dynamicbase,--nxcompat,--high-entropy-va)
+  # The stack protector flag is also a link flag: GCC adds libssp where the CRT lacks the symbols.
   target_compile_options(waywin-windows-probe PRIVATE -fstack-protector-strong)
+  target_link_options(waywin-windows-probe PRIVATE -municode -static -static-libgcc -static-libstdc++
+    -fstack-protector-strong -Wl,--dynamicbase,--nxcompat)
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    target_link_options(waywin-windows-probe PRIVATE -Wl,--high-entropy-va)
+  endif()
 endif()

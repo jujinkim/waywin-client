@@ -29,6 +29,7 @@ class EndpointTests(unittest.TestCase):
             "rdp://pc.example:3390/": "pc.example:3390", "rdp://pc.example": "pc.example:3389",
             "[2001:db8::1]:3391": "[2001:db8::1]:3391", "2001:db8::1": "[2001:db8::1]:3389",
             "rdp://[::1]": "[::1]:3389", "PC.EXAMPLE": "pc.example:3389",
+            "fe80::1%eth0": "[fe80::1%eth0]:3389", "[fe80::1%wlp2s0]:3390": "[fe80::1%wlp2s0]:3390",
         }.items():
             with self.subTest(value=value): self.assertEqual(probe.endpoint(value), expected)
 
@@ -36,7 +37,8 @@ class EndpointTests(unittest.TestCase):
         for value in ("", "https://pc", "rdp://user:secret@pc", "pc:0", "pc:65536", "pc:",
                       "pc:abc", "pc/path", "pc?x=y", "pc#x", "/p:secret", "pc\n/p:secret",
                       "pc space", "-bad.host", "rdp://[xyz]", "rdp://", "pc..example",
-                      "999.1.1.1", "1.2.3", "0x7f.1", "2130706433", "pc.123"):
+                      "999.1.1.1", "1.2.3", "0x7f.1", "2130706433", "pc.123",
+                      "fe80::1%]:1", "fe80::1%a,b", "::1%x:y", "::1%@", "[fe80::1%a b]", "rdp://[fe80::1%a,b]"):
             with self.subTest(value=value), self.assertRaises(probe.ProbeError): probe.endpoint(value)
 
     def test_domain_is_separate_and_no_secret_or_redirection_flags(self):
@@ -186,6 +188,9 @@ class EnvironmentTests(unittest.TestCase):
             env = probe.session_environment()
         self.assertEqual({key: env[key] for key in kept}, kept)
         self.assertEqual(set(env) - set(kept), {"SDL_VIDEO_DRIVER", "WAYWIN_PROBE_EVENTS", "WLOG_LEVEL", "WLOG_APPENDER"})
+        for value, expected in (("fcitx", "fcitx"), ("ibus", "ibus"), ("/tmp/module.so", None)):
+            with patch.dict(os.environ, {"SDL_IM_MODULE": value}, clear=True):
+                self.assertEqual(probe.session_environment().get("SDL_IM_MODULE"), expected)
         self.assertEqual((env["SDL_VIDEO_DRIVER"], env["WLOG_APPENDER"], env["WLOG_LEVEL"]), ("wayland", "CONSOLE", "ERROR"))
 
     def test_macos_not_mistaken_for_target(self):
@@ -394,7 +399,10 @@ class ProvenanceTests(unittest.TestCase):
     def test_matching_build_is_accepted_and_libraries_are_listed(self):
         with tempfile.TemporaryDirectory() as name:
             path, data, binary, _ = self.manifest(Path(name).resolve())
-            self.assertEqual(sorted(data["libraries"]), ["lib/libfreerdp3.so.3.33.1", "lib/libwinpr3.3.33.1.dylib"])
+            self.assertEqual(data["libraries"], {
+                "lib/libfreerdp3.so.3": "-> lib/libfreerdp3.so.3.33.1",
+                "lib/libfreerdp3.so.3.33.1": probe.sha256(directory_library := Path(name).resolve() / "lib/libfreerdp3.so.3.33.1"),
+                "lib/libwinpr3.3.33.1.dylib": probe.sha256(directory_library.with_name("libwinpr3.3.33.1.dylib"))})
             self.assertEqual(probe.verified_binary(path)[0], binary)
 
     def test_binary_tampering_rejected(self):
@@ -413,7 +421,17 @@ class ProvenanceTests(unittest.TestCase):
             self.addCleanup(outside.unlink)
             (directory / "lib" / "libfreerdp3.so.3").unlink()
             (directory / "lib" / "libfreerdp3.so.3").symlink_to(outside)
-        for change in (modified, added, removed, redirected):
+        def repointed_inside(directory, library):
+            (directory / "payload.bin").write_bytes(b"not a built library")
+            (directory / "lib" / "libfreerdp3.so.3").unlink()
+            (directory / "lib" / "libfreerdp3.so.3").symlink_to("../payload.bin")
+        def repointed_to_other_library(directory, library):
+            (directory / "lib" / "libfreerdp3.so.3").unlink()
+            (directory / "lib" / "libfreerdp3.so.3").symlink_to("libwinpr3.3.33.1.dylib")
+        def link_added(directory, library): (directory / "lib" / "libssl.so.3").symlink_to("libfreerdp3.so.3.33.1")
+        def looped(directory, library): (directory / "lib" / "libloop.so").symlink_to("libloop.so")
+        for change in (modified, added, removed, redirected, repointed_inside, repointed_to_other_library,
+                       link_added, looped):
             with self.subTest(change=change.__name__), tempfile.TemporaryDirectory() as name:
                 directory = Path(name).resolve()
                 path, _, _, library = self.manifest(directory)
@@ -543,6 +561,15 @@ class PrepareTests(unittest.TestCase):
                 pass
         with probe.exclusive_cache():
             pass
+        # The lock file is never truncated and never followed through a link.
+        lock = self.source.parent / "probe.lock"
+        lock.unlink()
+        victim = self.source.parent / "victim.txt"
+        victim.write_text("important")
+        lock.symlink_to(victim)
+        with self.assertRaises(probe.ProbeError), probe.exclusive_cache():
+            pass
+        self.assertEqual(victim.read_text(), "important")
 
 
 class CommandLineTests(unittest.TestCase):

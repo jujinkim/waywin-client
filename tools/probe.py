@@ -102,25 +102,34 @@ def command(args: list[str | Path], *, step: str, capture: bool = False, env: di
     except FileNotFoundError:
         raise ProbeError(f"{step}: the program is not installed or not on PATH") from None
     except subprocess.CalledProcessError as error:
-        raise ProbeError(f"{step} failed with exit status {error.returncode}; see its output above") from None
+        raise ProbeError(f"{step} failed with exit status {error.returncode}; see its error output above") from None
     return result.stdout or ""
 
 
 @contextlib.contextmanager
 def exclusive_cache():
     # prepare and build share one source checkout and one build directory.
-    SOURCE.parent.mkdir(parents=True, exist_ok=True)
-    with open(SOURCE.parent / "probe.lock", "w") as handle:
-        try:
-            import fcntl
-        except ImportError:  # Not POSIX: no advisory lock available.
-            yield
-            return
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            raise ProbeError("Another prepare or build is using this checkout; wait for it to finish") from None
+    try:
+        import fcntl
+    except ImportError:  # Not POSIX: no advisory lock available.
         yield
+        return
+    try:
+        SOURCE.parent.mkdir(parents=True, exist_ok=True)
+        # No truncation and no symlink: the path is fixed, its content is never used.
+        descriptor = os.open(SOURCE.parent / "probe.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        raise ProbeError("Cannot open the cache lock file; the dependency cache must be writable") from None
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ProbeError("Another prepare or build is using this checkout; wait for it to finish") from None
+        except OSError:
+            raise ProbeError("The cache lock file cannot be locked on this filesystem") from None
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def source_diff() -> str:
@@ -209,16 +218,27 @@ def runtime_libraries(build_dir: Path) -> dict:
     The executable is a thin front end; protocol, TLS and certificate code is in these files.
     """
     root = build_dir.resolve()
-    result = {}
+    result, links = {}, {}
     for path in sorted(build_dir.rglob("*")):
         if "CMakeFiles" in path.parts or not re.search(r"\.(?:so(?:\.[0-9]+)*|dylib)$", path.name):
             continue
+        name = path.relative_to(build_dir).as_posix()
         if path.is_symlink():
-            # Version links are expected, but only to files that are hashed here.
-            if not path.resolve().is_relative_to(root):
+            try:
+                target = path.resolve(strict=True)
+            except (OSError, RuntimeError):
+                raise ProbeError("A library link in the build tree cannot be resolved") from None
+            if not target.is_relative_to(root):
                 raise ProbeError("A library link in the build tree points outside it")
+            links[name] = target.relative_to(root).as_posix()
         elif path.is_file():
-            result[path.relative_to(build_dir).as_posix()] = sha256(path)
+            result[name] = sha256(path)
+    # The loader follows the version links, so they are part of what is verified: each must
+    # lead to a file hashed above, and a re-pointed or added link changes the record.
+    for name, target in links.items():
+        if target not in result:
+            raise ProbeError("A library link in the build tree does not lead to a built library")
+        result[name] = "-> " + target
     return result
 
 
@@ -272,13 +292,21 @@ def doctor() -> dict:
             "target_ready": all(checks.values()), "runtime_verified": False}
 
 
+def checked_zone(address):
+    # ipaddress accepts any text after "%"; the client would then split the address at "]" or ",".
+    zone = getattr(address, "scope_id", None)
+    if zone is not None and not re.fullmatch(r"[A-Za-z0-9._-]{1,15}", zone):
+        raise ProbeError("Invalid IPv6 zone")
+    return address
+
+
 def endpoint(value: str) -> str:
     """Accept DNS, IPv4, bracketed or bare IPv6, or rdp://host[:port]."""
     if not value or any(c.isspace() or ord(c) < 32 for c in value):
         raise ProbeError("Server must be an IP/DNS address, optionally with a port")
     if "://" not in value and value.count(":") > 1 and not value.startswith("["):
         try:
-            return f"[{ipaddress.IPv6Address(value)}]:3389"
+            return f"[{checked_zone(ipaddress.IPv6Address(value))}]:3389"
         except ValueError:
             raise ProbeError("Use [IPv6]:port for an IPv6 address with a port") from None
     try:
@@ -293,7 +321,7 @@ def endpoint(value: str) -> str:
         raise ProbeError("Use rdp://host:port without credentials, path, query or fragment")
     try:
         address = ipaddress.ip_address(host)
-        host = f"[{address}]" if address.version == 6 else str(address)
+        host = f"[{checked_zone(address)}]" if address.version == 6 else str(address)
     except ValueError:
         if ":" in host or "%" in host or parsed.netloc.startswith("["):
             raise ProbeError("Invalid IP address") from None
@@ -505,6 +533,9 @@ def verified_binary(manifest_path: Path) -> tuple[Path, dict]:
 def session_environment() -> dict:
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(ENV_DROP_PREFIXES) and key.upper() not in ENV_DROP_NAMES}
+    # The one SDL setting kept: it selects the input method framework, never a path or module.
+    if os.environ.get("SDL_IM_MODULE") in ("ibus", "fcitx", "fcitx5"):
+        env["SDL_IM_MODULE"] = os.environ["SDL_IM_MODULE"]
     env.update(SDL_VIDEO_DRIVER="wayland", WAYWIN_PROBE_EVENTS="1", WLOG_LEVEL="ERROR",
                WLOG_APPENDER="CONSOLE")
     return env

@@ -329,7 +329,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 refreshStatus();
                 return 0;
             }
-            ++trayMenus;  // Counts menus that were actually shown.
+            ++trayMenus;  // Counts menus that were created and requested.
             SetForegroundWindow(mainWindow);
             const UINT selected = static_cast<UINT>(TrackPopupMenu(menu,
                 TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, mainWindow, nullptr));
@@ -370,7 +370,10 @@ int WINAPI wWinMain(HINSTANCE appInstance, HINSTANCE, PWSTR, int show) {
     instance = appInstance;
     started = GetTickCount64();
     // ShellExecuteW may activate COM handlers (the ms-settings: pages do).
-    const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+    struct ComApartment {
+        bool ready = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+        ~ComApartment() { if (ready) CoUninitialize(); }
+    } com;
     GUID guid{};
     wchar_t buffer[40]{};
     if (FAILED(CoCreateGuid(&guid)) || !StringFromGUID2(guid, buffer, 40) ||
@@ -404,6 +407,5 @@ int WINAPI wWinMain(HINSTANCE appInstance, HINSTANCE, PWSTR, int show) {
             DispatchMessageW(&message);
         }
     }
-    if (comReady) CoUninitialize();
     return result == -1 ? 1 : 0;
 }
