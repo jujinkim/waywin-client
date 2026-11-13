@@ -21,14 +21,14 @@ Ubuntu 26.04 준비 명령(이번 macOS 세션에서는 실행하지 않음):
 sudo apt update
 sudo apt install build-essential cmake ninja-build git python3 pkg-config \
   libsdl3-dev libsdl3-ttf-dev libssl-dev zlib1g-dev libcjson-dev libjson-c-dev \
-  libwayland-dev wayland-protocols libxkbcommon-dev liburiparser-dev
+  libwayland-dev wayland-protocols libxkbcommon-dev liburiparser-dev libicu-dev
 python3 tools/probe.py build
 ```
 
 배포판의 [SDL3 개발 패키지](https://packages.ubuntu.com/resolute/libsdl3-dev)와 [SDL3_ttf 개발 패키지](https://packages.ubuntu.com/resolute/libsdl3-ttf-dev)를 사용한다. 패키지 버전을 임의로 최신 버전으로 가정하지 않는다. SDL/시스템 라이브러리는 OS 패키지를 사용하므로 이 빌드는 완전히 격리된 재현 빌드가 아니다. `build-manifest.json`에 FreeRDP 커밋·패치/프로필/실행파일 해시·주요 의존성 버전·CMake 캐시 해시를 남기며, 재현에는 같은 시스템 패키지와 툴체인도 필요하다. Ubuntu에서는 다음 정보를 결과와 함께 보관한다.
 
 ```sh
-dpkg-query -W libsdl3-dev libsdl3-ttf-dev libssl-dev zlib1g-dev libcjson-dev libjson-c-dev
+dpkg-query -W libsdl3-dev libsdl3-ttf-dev libssl-dev zlib1g-dev libcjson-dev libjson-c-dev libicu-dev
 cmake --version
 c++ --version
 ```
