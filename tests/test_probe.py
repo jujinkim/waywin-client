@@ -354,6 +354,10 @@ class LaunchTests(unittest.TestCase):
                 child = original_popen(*argv, **kwargs)
                 children.append(child)
                 return child
+            cleaning = threading.Event()
+            def stop(child):
+                cleaning.set()
+                original_stop(child, timeout=1.0)
             def interrupt_twice():
                 # The first event proves the child ignores SIGTERM and run() is inside its try block.
                 deadline = time.monotonic() + 10
@@ -361,19 +365,25 @@ class LaunchTests(unittest.TestCase):
                         path.stat().st_size for path in args.output.glob("*/events.jsonl")):
                     time.sleep(0.02)
                 os.kill(os.getpid(), signal.SIGINT)
-                time.sleep(0.3)  # Inside stop_child's grace period.
-                os.kill(os.getpid(), signal.SIGINT)
+                if cleaning.wait(10):  # Now inside stop_child's grace period.
+                    os.kill(os.getpid(), signal.SIGINT)
+                    os.kill(os.getpid(), signal.SIGTERM)
             sender = threading.Thread(target=interrupt_twice)
+            handlers = [signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)]
             try:
                 with patch.object(probe, "doctor", return_value={"target_ready": True}), \
                      patch.object(probe, "verified_binary", return_value=(executable,
                              {"system": "Linux", "native_wayland_helpers": True})), \
                      patch.object(probe.subprocess, "Popen", side_effect=spawn), \
-                     patch.object(probe, "stop_child", side_effect=lambda child: original_stop(child, timeout=1.0)), \
+                     patch.object(probe, "stop_child", side_effect=stop), \
                      patch("sys.stdout", new_callable=io.StringIO):
                     sender.start()
-                    self.assertEqual(probe.run(args), 1)
+                    try:
+                        self.assertEqual(probe.run(args), 1)
+                    except KeyboardInterrupt:
+                        self.fail("a repeated signal aborted the cleanup")
                 sender.join()
+                self.assertEqual([signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)], handlers)
                 self.assertIsNotNone(children[0].poll())
                 record = json.loads(next(args.output.glob("*/exit.json")).read_text())
                 self.assertEqual(record["exit_code"], 130)

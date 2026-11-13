@@ -323,7 +323,10 @@ def stop_child(child: subprocess.Popen, timeout: float = 3.0) -> None:
                 os.killpg(child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            child.wait()
+            try:
+                child.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                pass  # Unreapable after SIGKILL; do not block the caller's record keeping.
         except ProcessLookupError:
             child.wait()
 
@@ -388,9 +391,14 @@ def run(args) -> int:
     started = time.monotonic()
     child = None
     exit_code = None
+    stopping = False
     def interrupted(signum, frame):
-        raise KeyboardInterrupt
-    previous_term = signal.signal(signal.SIGTERM, interrupted)
+        # Only the first Ctrl-C or SIGTERM interrupts; later ones must not abort the cleanup.
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            raise KeyboardInterrupt
+    previous = {number: signal.signal(number, interrupted) for number in (signal.SIGINT, signal.SIGTERM)}
     try:
         fd = os.open(directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as output:
@@ -412,20 +420,25 @@ def run(args) -> int:
     except KeyboardInterrupt:
         exit_code = 130
     finally:
-        # Cleanup is bounded by stop_child. A second Ctrl-C or SIGTERM here must not skip the
-        # forced kill or exit.json, so both are ignored until it is done.
-        previous_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         try:
-            if child:
-                stop_child(child)
-                if child.stderr:
-                    child.stderr.close()
-            private_json(directory / "exit.json", {"exit_code": exit_code, "events_seen": count,
-                         "events_truncated": count > 100000, "runtime_verified": False})
+            while True:
+                try:
+                    # A signal can still raise until this assignment, so nothing below it is
+                    # ever interrupted half way; the retry then runs the cleanup once.
+                    stopping = True
+                    if child:
+                        stop_child(child)
+                        if child.stderr:
+                            child.stderr.close()
+                    private_json(directory / "exit.json", {"exit_code": exit_code, "events_seen": count,
+                                 "events_truncated": count > 100000, "runtime_verified": False})
+                    break
+                except KeyboardInterrupt:
+                    continue
         finally:
-            signal.signal(signal.SIGINT, previous_int)
-            signal.signal(signal.SIGTERM, previous_term)
+            for number, handler in previous.items():
+                if handler is not None:  # None: installed outside Python, cannot be reinstated.
+                    signal.signal(number, handler)
     print(f"Disconnected (exit={exit_code}, events={count}). No compatibility verdict was inferred.")
     return 0 if exit_code == 0 else 1
 
