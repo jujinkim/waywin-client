@@ -33,7 +33,7 @@ Windows 셸 메뉴의 실제 실행·RAIL 별도 전송, GNOME 혼합 배율·ho
 | Ubuntu에서 문서대로 빌드하면 configure 실패 가능 | 프로필에 `WITH_FUSE OFF`, 패키지 목록에 `libicu-dev` | macOS configure만 통과. **Ubuntu 빌드 미실행.** 프로필 해시가 바뀌어 기존 빌드 명세는 무효, 재빌드 필요 |
 | MSVC 빌드의 manifest 중복 | MSVC에서 `/MANIFEST:NO` | MinGW 교차 빌드 통과. **MSVC 빌드 미실행** |
 | 정리 중 두 번째 Ctrl-C가 강제 종료와 `exit.json`을 건너뜀 | 첫 신호만 중단으로 처리, 정리 재시도, SIGKILL 후 대기 5초 제한, 처리기 복원 | 수정 전 실패하는 테스트 추가. SIGHUP은 아래에서 처리 |
-| 패치 비교가 사용자 git 설정에 의존 | diff 형식을 명령행에서 고정, `GIT_DIFF_OPTS`·사용자 attributes 제외 | 적대적 설정에서 실제 `prepare` 통과. 캐시 저장소 내부의 `.git/info/attributes`는 여전히 영향 |
+| 패치 비교가 사용자 git 설정에 의존 | diff 형식을 명령행에서 고정, `GIT_DIFF_OPTS`·사용자 attributes 제외 | 적대적 설정에서 실제 `prepare` 통과. 캐시 저장소 내부의 `.git/info/attributes`는 여전히 영향(아래 「실환경 없이 진행한 도구 보완」에서 해결) |
 
 당시 재검증: 자동 테스트 32개 통과(Python 3.12), CTest 통과. 이 PC의 기본 `python3`는 3.9라 `python3.12`로 실행해야 한다.
 
@@ -76,6 +76,7 @@ Windows 셸 메뉴의 실제 실행·RAIL 별도 전송, GNOME 혼합 배율·ho
 | 항목 | 조치 | 확인한 것 / 남은 것 |
 |---|---|---|
 | 데스크톱 실행의 드라이버 미관측 | 드라이버 기록을 RAIL 초기화에서 `main()`의 `SDL_Init` 직후로 옮김. 데스크톱·RAIL 모두 접속 전에 한 번 기록. 패치가 두 파일이 되어 락 해시 갱신 | macOS 재빌드 통과. 닫힌 루프백 포트 접속에서 두 모드 모두 `driver=offscreen` 한 줄, `WAYWIN_PROBE_EVENTS`가 `1`이 아니면 출력 없음. 패치 해시가 바뀌어 **기존 빌드 명세는 모두 무효**, Ubuntu에서도 재빌드 필요. Wayland 실관측은 미실행 |
+| `prepare`가 호출 환경의 Git 상태에 영향받음 | 저장소 위치·설정 주입 변수(`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE`, `GIT_CONFIG_PARAMETERS`/`COUNT`, `GIT_ATTR_SOURCE` 등)를 모든 Git 호출에서 제거. 비교의 파일 순서(`diff.orderFile`)를 고정하고 `apply`의 공백 수정을 끔. 캐시 자체의 `info/attributes`에 내용이 있거나 무시 목록에 가려진 `.gitattributes`가 있으면 중단. 미추적 파일 검사에 사용자 전역 무시 파일을 쓰지 않음 | Git hook 안에서 실행하면 `git -C <캐시>`가 다른 저장소를 비교·패치할 수 있었다. 패치가 두 파일이 되면서 파일 순서 설정도 비교에 영향을 주게 됨. 새 테스트는 수정 전 코드에서 실패. 캐시 로컬 설정의 `filter` 정의는 attributes가 있어야 동작하므로 attributes 경로를 막는 것으로 대신함 |
 
 ## 진행
 

@@ -48,6 +48,10 @@ ENV_DROP_NAMES = frozenset({
     "WTSAPI_LIBRARY", "SSLKEYLOGFILE", "TZDIR", "GCONV_PATH", "LOCPATH", "GTK_MODULES", "GTK_PATH",
     "GIO_EXTRA_MODULES", "GIO_MODULE_DIR", "QT_PLUGIN_PATH", "LIBDECOR_PLUGIN_DIR",
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"})
+GIT_DROP_NAMES = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_ATTR_SOURCE",
+    "GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"})
 CASES = {
     "P01": "Native Wayland: display, move, resize, input, popups",
     "P02": "Existing AND new windows discovered; representative app inventory",
@@ -132,18 +136,40 @@ def exclusive_cache():
         os.close(descriptor)
 
 
+def git_environment() -> dict:
+    # Variables that point git at another repository, index or attribute source, or that inject
+    # settings and diff options. A git hook exports some of them (GIT_DIR, GIT_INDEX_FILE), and
+    # with them `git -C <cache>` would read, compare or patch a different checkout.
+    env = {key: value for key, value in os.environ.items()
+           if key not in GIT_DROP_NAMES and not key.startswith("GIT_CONFIG_KEY_")
+           and not key.startswith("GIT_CONFIG_VALUE_")}
+    env["GIT_ATTR_NOSYSTEM"] = "1"
+    return env
+
+
+def git(*arguments, step: str, capture: bool = False) -> str:
+    return command(["git", *arguments], step=step, capture=capture, env=git_environment())
+
+
 def source_diff() -> str:
     # The text is compared byte for byte with the approved patch, so user and system settings
     # that shape it are pinned. Otherwise a correct checkout is reported as modified.
-    env = {key: value for key, value in os.environ.items()
-           if key not in ("GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF")}
-    env["GIT_ATTR_NOSYSTEM"] = "1"
-    return command(["git", "-C", SOURCE, "-c", "core.quotePath=true", "-c", "diff.suppressBlankEmpty=false",
-                    "-c", "core.attributesFile=" + os.devnull,
-                    "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
-                    "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "--inter-hunk-context=0",
-                    "--diff-algorithm=myers", "--indent-heuristic", "--abbrev=7", "HEAD"],
-                   step="Comparing the dependency source with the patch", capture=True, env=env)
+    # Attributes in the checkout's own info/attributes cannot be switched off from the command
+    # line; they can mark a file binary, or name a filter that rewrites what the diff shows.
+    location = git("-C", SOURCE, "rev-parse", "--git-path", "info/attributes",
+                   step="Locating the dependency attributes", capture=True).strip()
+    attributes = SOURCE / location  # An absolute answer replaces SOURCE.
+    if attributes.is_file() and any(
+            line.strip() and not line.lstrip().startswith("#")
+            for line in attributes.read_text(encoding="utf-8", errors="replace").splitlines()):
+        raise ProbeError("The dependency checkout has its own attributes (info/attributes); "
+                         "move them aside and run prepare again")
+    return git("-C", SOURCE, "-c", "core.quotePath=true", "-c", "diff.suppressBlankEmpty=false",
+               "-c", "core.attributesFile=" + os.devnull,
+               "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
+               "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "--inter-hunk-context=0",
+               "--diff-algorithm=myers", "--indent-heuristic", "--abbrev=7", "-O" + os.devnull, "HEAD",
+               step="Comparing the dependency source with the patch", capture=True)
 
 
 def private_json(path: Path, data: dict) -> None:
@@ -165,28 +191,35 @@ def prepare() -> None:
             raise ProbeError("Unexpected file at the temporary clone path; inspect it first")
         shutil.rmtree(partial, ignore_errors=True)
         SOURCE.parent.mkdir(parents=True, exist_ok=True)
-        command(["git", "-c", "advice.detachedHead=false", "clone", "--depth", "1", "--branch", dependency["tag"],
-                 dependency["repository"], partial], step="Fetching the pinned FreeRDP source")
+        git("-c", "advice.detachedHead=false", "clone", "--depth", "1", "--branch", dependency["tag"],
+            dependency["repository"], partial, step="Fetching the pinned FreeRDP source")
         os.rename(partial, SOURCE)
     # Without its own repository here, git would answer for the enclosing WayWin checkout.
-    top = command(["git", "-C", SOURCE, "rev-parse", "--show-toplevel"],
-                  step="Checking the dependency checkout", capture=True).strip()
+    top = git("-C", SOURCE, "rev-parse", "--show-toplevel",
+              step="Checking the dependency checkout", capture=True).strip()
     if not top or Path(top).resolve() != SOURCE.resolve():
         raise ProbeError("Dependency cache is not a complete checkout; move it aside and run prepare again")
-    if command(["git", "-C", SOURCE, "rev-parse", "HEAD"], step="Reading the dependency commit",
-               capture=True).strip() != dependency["commit"]:
+    if git("-C", SOURCE, "rev-parse", "HEAD", step="Reading the dependency commit",
+           capture=True).strip() != dependency["commit"]:
         raise ProbeError("Unexpected source commit; use a separate clean cache")
     # Do not discard developer changes or apply the patch twice.
-    if command(["git", "-C", SOURCE, "ls-files", "--others", "--exclude-standard"],
-               step="Listing untracked dependency files", capture=True):
+    # The user's global ignore file must not hide files in the cache.
+    untracked = ("-C", SOURCE, "-c", "core.excludesFile=" + os.devnull, "ls-files", "-z", "--others",
+                 "--exclude-standard")
+    if git(*untracked, step="Listing untracked dependency files", capture=True):
         raise ProbeError("Untracked files in dependency source; inspect them first")
+    # An ignored attributes file still applies, and could rewrite what the comparison sees.
+    if any(Path(name).name == ".gitattributes" for name in git(
+            *untracked, "--ignored", step="Listing ignored dependency files", capture=True).split("\0")):
+        raise ProbeError("An ignored .gitattributes file is in the dependency source; inspect it first")
     changes = source_diff()
     expected = PATCH.read_text(encoding="utf-8")
     if changes and changes != expected:
         raise ProbeError("Dependency has changes other than the approved observer patch")
     if not changes:
-        command(["git", "-C", SOURCE, "apply", "--check", PATCH], step="Checking that the patch applies")
-        command(["git", "-C", SOURCE, "apply", PATCH], step="Applying the patch")
+        # apply.whitespace=fix in a user's settings would rewrite the added lines.
+        for step, extra in (("Checking that the patch applies", ["--check"]), ("Applying the patch", [])):
+            git("-C", SOURCE, "apply", "--whitespace=nowarn", *extra, PATCH, step=step)
     if source_diff() != expected:
         raise ProbeError("Applied patch differs from expected patch")
 

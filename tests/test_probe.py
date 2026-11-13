@@ -379,24 +379,54 @@ class ProvenanceTests(unittest.TestCase):
                 return subprocess.run(["git", "-C", source, "-c", "user.name=test", "-c", "user.email=test@localhost",
                                        *arguments], check=True, capture_output=True, text=True, env=env).stdout
             lines = [f"line {number}\n" for number in range(40)]
-            (source / "file.txt").write_text("".join(lines))
+            for name in ("a.txt", "file.txt"):
+                (source / name).write_text("".join(lines))
             git("init", "--quiet")
-            git("add", "file.txt")
+            git("add", "a.txt", "file.txt")
             git("commit", "--quiet", "--message", "base")
             lines[5] = lines[30] = "changed\n"
-            (source / "file.txt").write_text("".join(lines))
+            for name in ("a.txt", "file.txt"):
+                (source / name).write_text("".join(lines))
             approved = git("diff", "--binary", "--no-ext-diff", "HEAD")
+            # A hook's GIT_DIR/GIT_INDEX_FILE name another repository with nothing changed in it.
+            other = root / "other"
+            other.mkdir()
+            subprocess.run(["git", "-C", other, "-c", "user.name=test", "-c", "user.email=test@localhost",
+                            "init", "--quiet"], check=True, env=clean)
             settings = root / "gitconfig"
             settings.write_text("[diff]\n\tnoprefix = true\n\tmnemonicPrefix = true\n\tcontext = 7\n"
                                 "\tinterHunkContext = 5\n\talgorithm = patience\n\tsuppressBlankEmpty = true\n"
-                                "\tindentHeuristic = false\n"
+                                f"\tindentHeuristic = false\n\torderFile = {root / 'order'}\n"
                                 f"[core]\n\tabbrev = 12\n\tattributesFile = {root / 'attributes'}\n"
                                 "[color]\n\tui = always\n")
             (root / "attributes").write_text("*.txt -diff\n")
-            hostile = {"GIT_CONFIG_GLOBAL": str(settings), "GIT_DIFF_OPTS": "--unified=9"}
-            self.assertNotEqual(git("diff", "--binary", "--no-ext-diff", "HEAD", env={**clean, **hostile}), approved)
+            (root / "order").write_text("file.txt\na.txt\n")
+            hostile = {"GIT_CONFIG_GLOBAL": str(settings), "GIT_DIFF_OPTS": "--unified=9",
+                       "GIT_DIR": str(other / ".git"), "GIT_INDEX_FILE": str(other / ".git" / "index"),
+                       "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "diff.context", "GIT_CONFIG_VALUE_0": "5",
+                       "GIT_CONFIG_PARAMETERS": "'diff.noprefix'='true'"}
+            for name in ("GIT_CONFIG_GLOBAL", "GIT_DIFF_OPTS", "GIT_DIR", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"):
+                single = {name: hostile[name]}
+                if name == "GIT_DIR":
+                    single["GIT_INDEX_FILE"] = hostile["GIT_INDEX_FILE"]
+                if name == "GIT_CONFIG_COUNT":
+                    single.update(GIT_CONFIG_KEY_0="diff.context", GIT_CONFIG_VALUE_0="5")
+                with self.subTest(setting=name):
+                    self.assertNotEqual(subprocess.run(
+                        ["git", "-C", source, "diff", "--binary", "--no-ext-diff", "HEAD"], check=False,
+                        capture_output=True, text=True, env={**clean, **single}).stdout, approved)
             with patch.object(probe, "SOURCE", source), patch.dict(os.environ, {**clean, **hostile}):
                 self.assertEqual(probe.source_diff(), approved)
+            # The checkout's own attributes cannot be overridden, so they are refused instead.
+            local = source / ".git" / "info" / "attributes"
+            local.parent.mkdir(exist_ok=True)
+            local.write_text("# comments and blank lines are harmless\n\n")
+            with patch.object(probe, "SOURCE", source), patch.dict(os.environ, clean):
+                self.assertEqual(probe.source_diff(), approved)
+                local.write_text("*.txt -diff\n")
+                with self.assertRaises(probe.ProbeError) as raised:
+                    probe.source_diff()
+            self.assertIn("info/attributes", str(raised.exception))
 
     def manifest(self, directory):
         (directory / "bin").mkdir()
@@ -537,6 +567,40 @@ class PrepareTests(unittest.TestCase):
         (self.source / "note.txt").write_text("untracked")
         with self.assertRaises(probe.ProbeError): probe.prepare()
         self.assertTrue((self.source / "note.txt").exists())
+
+    def test_user_apply_and_repository_settings_do_not_change_the_result(self):
+        # Trailing whitespace in an added line: apply.whitespace=fix would strip it.
+        (self.upstream / "file.txt").write_text("".join(
+            "observed  \n" if number == 7 else f"line {number}\n" for number in range(20)))
+        self.patch_file.write_text(self.git(self.upstream, "diff", "--binary", "--no-ext-diff", "HEAD"))
+        self.git(self.upstream, "checkout", "--quiet", "--", "file.txt")
+        self.dependency["probe_patch_sha256"] = probe.sha256(self.patch_file)
+        settings = Path(self.directory.name) / "gitconfig"
+        settings.write_text("[apply]\n\twhitespace = fix\n")
+        hook = Path(self.directory.name).resolve() / "hook-repository"
+        hook.mkdir()
+        self.git(hook, "init", "--quiet")
+        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(settings), "GIT_DIR": str(hook / ".git"),
+                                     "GIT_WORK_TREE": str(hook)}):
+            probe.prepare()
+            probe.prepare()
+        self.assertIn("observed  \n", (self.source / "file.txt").read_text())
+        self.assertEqual(self.git(hook, "status", "--porcelain"), "")
+        # Files hidden by the user's global ignore file, or attributes hidden by the checkout's
+        # own exclude list, are still found.
+        ignore = Path(self.directory.name) / "ignore"
+        ignore.write_text("*.local\n")
+        settings.write_text(f"[core]\n\texcludesFile = {ignore}\n")
+        (self.source / "notes.local").write_text("untracked")
+        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(settings)}), self.assertRaises(probe.ProbeError):
+            probe.prepare()
+        (self.source / "notes.local").unlink()
+        (self.source / ".git" / "info").mkdir(exist_ok=True)
+        (self.source / ".git" / "info" / "exclude").write_text(".gitattributes\n")
+        (self.source / ".gitattributes").write_text("*.txt -diff\n")
+        with self.assertRaises(probe.ProbeError) as raised:
+            probe.prepare()
+        self.assertIn(".gitattributes", str(raised.exception))
 
     def test_wrong_patch_or_commit_is_rejected(self):
         self.dependency["probe_patch_sha256"] = "0" * 64

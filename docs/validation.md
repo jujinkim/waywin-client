@@ -13,7 +13,7 @@ Windows 시험 앱은 최종 보조 앱이 아니다. Notepad와 Windows shell �
 
 ## 빌드와 출처
 
-FreeRDP는 `dependencies.lock.json`의 태그로 내려받고 커밋 해시로 검사한다. 태그 서명은 검증하지 않으며, 이미 있는 캐시는 커밋만 확인한다. 내려받기는 임시 경로에 한 뒤 옮기므로 중단된 내려받기가 완성본으로 취급되지 않는다. `prepare`와 `build`는 동시에 하나만 실행된다. 원본은 `.cache/FreeRDP-3.33.1`, 결과는 `build/freerdp-probe`에 둔다. 예상한 패치 이외의 변경이 있으면 중단하며 기존 변경을 지우지 않는다. 기존 시스템 FreeRDP를 덮어쓰지 않는다.
+FreeRDP는 `dependencies.lock.json`의 태그로 내려받고 커밋 해시로 검사한다. 태그 서명은 검증하지 않으며, 이미 있는 캐시는 커밋만 확인한다. 내려받기는 임시 경로에 한 뒤 옮기므로 중단된 내려받기가 완성본으로 취급되지 않는다. `prepare`와 `build`는 동시에 하나만 실행된다. 원본은 `.cache/FreeRDP-3.33.1`, 결과는 `build/freerdp-probe`에 둔다. 예상한 패치 이외의 변경이 있으면 중단하며 기존 변경을 지우지 않는다. 패치 비교와 적용은 사용자 Git 설정의 diff 형식·파일 순서·`apply.whitespace`에 영향받지 않으며, Git hook 등이 내보낸 저장소 위치·설정 주입 변수(`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_PARAMETERS` 등)는 넘기지 않는다. 캐시 저장소 자체의 `.git/info/attributes`는 명령행에서 끌 수 없으므로 내용이 있으면 중단한다. 기존 시스템 FreeRDP를 덮어쓰지 않는다.
 
 Ubuntu 26.04 준비 명령(이번 macOS 세션에서는 실행하지 않음):
 
