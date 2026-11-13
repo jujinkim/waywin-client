@@ -15,6 +15,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from urllib.parse import urlsplit
@@ -35,6 +36,7 @@ EVENT_PATTERN = re.compile(
     rb") window=([0-9]{1,10}) icon=([0-9]{1,10}) flags=([0-9]{1,10})\n")
 DRIVERS = ("wayland", "x11", "cocoa", "windows", "dummy", "offscreen")
 EVENT_LIMIT = 100000
+GROUP_GRACE = 2.0
 CASES = {
     "P01": "Native Wayland: display, move, resize, input, popups",
     "P02": "Existing AND new windows discovered; representative app inventory",
@@ -344,6 +346,24 @@ def stop_child(child: subprocess.Popen, timeout: float = 3.0) -> None:
                 pass  # Unreapable after SIGKILL; do not block the caller's record keeping.
         except ProcessLookupError:
             child.wait()
+    # The child leads its own session, so its ID cannot be reused while members remain.
+    # Anything it started and left behind would otherwise outlive the run.
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def reap_group_after_exit(child: subprocess.Popen) -> None:
+    # The event loop ends on stderr EOF. A process the session started can hold that pipe
+    # open after the session itself has exited, which would block the loop for good.
+    child.wait()
+    try:
+        os.killpg(child.pid, 0)  # Members remain, so the group ID stays reserved for them.
+        time.sleep(GROUP_GRACE)
+        os.killpg(child.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def verified_binary(manifest_path: Path) -> tuple[Path, dict]:
@@ -410,12 +430,14 @@ def run(args) -> int:
     driver = None
     stopping = False
     def interrupted(signum, frame):
-        # Only the first Ctrl-C or SIGTERM interrupts; later ones must not abort the cleanup.
+        # Only the first signal interrupts; later ones must not abort the cleanup.
         nonlocal stopping
         if not stopping:
             stopping = True
             raise KeyboardInterrupt
-    previous = {number: signal.signal(number, interrupted) for number in (signal.SIGINT, signal.SIGTERM)}
+    # SIGHUP: closing the terminal or losing an SSH connection must also end the session.
+    previous = {number: signal.signal(number, interrupted)
+                for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
         fd = os.open(directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as output:
@@ -423,6 +445,7 @@ def run(args) -> int:
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                      start_new_session=True)
             print(f"Session process: {child.pid}", flush=True)
+            threading.Thread(target=reap_group_after_exit, args=(child,), daemon=True).start()
             for event in events(child.stderr):
                 if event["type"] == "driver":
                     driver = event["driver"]
