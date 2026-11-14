@@ -49,7 +49,7 @@ Validation::Validation(QWidget *parent):QWidget(parent),data(newReport()) {
     tabs->addTab(cases,"검증 항목");
     auto context=new QWidget;auto ctx=new QFormLayout(context);
     tester=new QLineEdit;date=new QLineEdit;ctx->addRow("검증자",tester);ctx->addRow("날짜 (YYYY-MM-DD)",date);
-    const QMap<QString,QString> labels{{"distribution","Linux 배포판·버전"},{"desktop","데스크톱·컴포지터·버전"},{"session_type","로그인 세션 (Wayland / X11 / WSLg 등)"},{"execution_environment","실행 환경 (실기기 / VM / WSLg)"},{"sdl_driver","실제 SDL 드라이버"},{"windows_edition_build","Windows 에디션·빌드"},{"rdp_policy","RDP·RemoteApp 정책"},{"freerdp_commit","FreeRDP 커밋"},{"patch_sha256","관측 패치 SHA256"}};
+    const QMap<QString,QString> labels{{"distribution","Linux 배포판·버전"},{"desktop","데스크톱·컴포지터·버전"},{"session_type","로그인 세션 (Wayland / X11 등)"},{"execution_environment","실행 환경 (실기기 / VM 등)"},{"sdl_driver","실제 SDL 드라이버"},{"windows_edition_build","Windows 에디션·빌드"},{"rdp_policy","RDP·RemoteApp 정책"},{"freerdp_commit","FreeRDP 커밋"},{"patch_sha256","관측 패치 SHA256"}};
     for(const auto &k:data["environment"].toObject().keys()) {auto line=new QLineEdit;environmentFields[k]=line;ctx->addRow(labels.value(k,k),line);connect(line,&QLineEdit::textChanged,this,[this]{update();});}
     apps=new QPlainTextEdit;apps->setPlaceholderText("한 줄에 앱 이름 | 버전. 최소 5개.");ctx->addRow("대표 앱",apps);
     auto scroll=new QScrollArea;scroll->setWidgetResizable(true);scroll->setWidget(context);tabs->addTab(scroll,"환경·앱 기록");

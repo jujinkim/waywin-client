@@ -175,7 +175,6 @@ QJsonObject environment(const QString &preference) {
     bool ready=true; for(auto it=checks.begin();it!=checks.end();++it) ready &= it.value().toBool();
     return {{"system",QSysInfo::prettyProductName()},{"machine",QSysInfo::currentCpuArchitecture()},
         {"desktop",env.value("XDG_CURRENT_DESKTOP","unknown")},{"session_type",env.value("XDG_SESSION_TYPE","unknown")},
-        {"wsl",env.contains("WSL_INTEROP")||env.contains("WSL_DISTRO_NAME")},
         {"requested_driver",preference},{"driver_candidates",QJsonArray::fromStringList(drivers)},
         {"checks",checks},{"target_ready",ready},{"runtime_verified",false}};
 }
@@ -257,7 +256,7 @@ QJsonObject migrateReport(QJsonObject r) {
     if(!env["distribution"].toString().isEmpty())env["distribution"]="Ubuntu "+env["distribution"].toString();
     if(!env["desktop"].toString().isEmpty())env["desktop"]="GNOME "+env["desktop"].toString();
     env["session_type"]=env["sdl_driver"];
-    env["execution_environment"]=""; // A legacy report does not establish physical/VM/WSLg provenance.
+    env["execution_environment"]=""; // A legacy report does not establish physical/virtual provenance.
     r["environment"]=env;r["schema"]=3;r["migrated_from_schema"]=2;r["independently_verified"]=false;
     return r;
 }

@@ -180,7 +180,6 @@ void Window::checkEnvironment(){
     const auto h=selected();const auto e=environment(h?h->displayBackend:"auto");
     QStringList drivers;for(const auto &v:e["driver_candidates"].toArray())drivers<<v.toString();
     QString text="환경: "+e["system"].toString()+"\n데스크톱: "+e["desktop"].toString()+" · 세션: "+e["session_type"].toString()+"\n화면 연결 설정: "+e["requested_driver"].toString()+"\n시도할 연결 방식: "+(drivers.isEmpty()?"없음":drivers.join(" → "))+"\n";
-    if(e["wsl"].toBool())text+="WSL 환경 · WSLg 결과는 일반 Linux 데스크톱과 구분해 기록하세요.\n";
     text+=e["target_ready"].toBool()?"연결을 시도할 수 있습니다. 화면 서버 접근과 실제 동작은 접속 후 확인합니다.":"접속에는 Linux와 사용 가능한 Wayland 또는 X11 화면 연결이 필요합니다. 설정·검증 기록 화면은 사용할 수 있습니다.";
     environmentLabel->setText(text);
 }

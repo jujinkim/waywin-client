@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 WayWin now develops the Qt/C++ product and Ubuntu/Windows validation in parallel, per the user instruction on 2026-11-14. Real-platform evidence remains required for compatibility and release claims. See `docs/product.md` for implemented and outstanding features.
 
-The product targets Linux Wayland and X11 across GNOME, KDE and other desktops, including WSLg as a separately recorded environment. Do not reintroduce Ubuntu-version/GNOME/Wayland-only product gates. The legacy Python feasibility probe retains its original GNOME Wayland scope; it is not a product prerequisite.
+The product targets Linux Wayland and X11 across GNOME, KDE and other desktops, without desktop-name restrictions. WSL is not a dedicated product target; do not add WSL-specific features, gates or validation requirements. Do not reintroduce Ubuntu-version/GNOME/Wayland-only product gates. The legacy Python feasibility probe retains its original GNOME Wayland scope; it is not a product prerequisite.
 
 - `app/`: native Qt product, session worker, host settings and GUI validation reports.
 - `tests/product/`: QtTest GUI, privacy, storage and process-isolation contracts.

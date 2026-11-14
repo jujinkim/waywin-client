@@ -79,8 +79,8 @@ private slots:
             QCOMPARE(WayWin::displayDrivers(env,"wayland"),QStringList({"wayland"}));
             env.insert("XDG_SESSION_TYPE","x11");QCOMPARE(WayWin::displayDrivers(env),QStringList({"x11","wayland"}));
         }
-        env.remove("XDG_SESSION_TYPE");env.remove("XDG_CURRENT_DESKTOP");env.insert("WSL_DISTRO_NAME","Ubuntu");
-        QCOMPARE(WayWin::displayDrivers(env),QStringList({"wayland","x11"})); // WSLg need not declare a desktop/session type.
+        env.remove("XDG_SESSION_TYPE");env.remove("XDG_CURRENT_DESKTOP");
+        QCOMPARE(WayWin::displayDrivers(env),QStringList({"wayland","x11"})); // A graphical connection need not declare a desktop/session name.
         env.insert("WAYLAND_DISPLAY",temp.filePath("wayland-test"));env.remove("XDG_RUNTIME_DIR");
         QCOMPARE(WayWin::displayDrivers(env,"wayland"),QStringList({"wayland"}));
         server.close();QCOMPARE(WayWin::displayDrivers(env),QStringList({"x11"}));
