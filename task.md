@@ -1,5 +1,16 @@
 # 작업 기록
 
+## Ubuntu 설치 중 GCC 경고 오류 수정 (2026-11-15)
+
+사용자 실환경 보고: Ubuntu 설치가 `[20/28]`에서 중단됐고, 122행 38열에 `misleadingly indented ... guarded by the 'if'` 진단이 표시됐다. Windows는 아직 시도하지 못했다. Ubuntu 전체 로그·배포판·컴파일러 버전은 확보하지 못했다.
+
+- `app/validation.cpp:122:38`의 `evidence->setText`가 보고한 위치와 일치했다. 조건부 증거 참조 추가와 항상 실행할 입력란 갱신을 중괄호·별도 행으로 구분했다. `-Werror`는 유지한다.
+- 기존 MinGW GCC 16.2로 해당 구문과 최소 타입 선언만 분리해 컴파일했다. 수정 전 같은 38열에 `-Werror=misleading-indentation`으로 실패하고 수정 후 통과했다. 이 검사는 전체 Linux 빌드나 Windows 실행 검증이 아니다.
+- macOS 제품 빌드 성공, CTest 2개 묶음(`probe-contracts`, `product-contracts`) 모두 통과. 설치 스크립트 구문과 `git diff --check` 통과. 동작 변경 없는 구문 수정으로 별도 테스트는 추가하지 않았다.
+- 수정 소스를 포함한 `out/release/waywin-0.3.0-linux-desktops.tar.gz` 인수 묶음을 다시 제작한다. 기존과 같은 폴더에 새 묶음을 풀고 Ubuntu 설치 진입점을 다시 실행하면 된다. Windows 바이너리는 기존과 같다.
+
+남은 확인: 수정 묶음의 실제 Ubuntu 설치 완료 여부와 Windows 실행. 이번 결과로 설치·RDP 호환성 합격을 선언하지 않는다.
+
 ## Linux 데스크톱·화면 연결 범위 확대 (2026-11-14)
 
 사용자 변경: “wayland에서만 되야한다는 법은 없음.. x11도 상관없고, gnome아니어도 kde 등에서도 되면 좋지”. 제품의 Ubuntu 버전·GNOME·Wayland 전용 실행 제한을 제거했다. 기존 0단계 Python 프로브의 제한은 비교용으로만 유지한다. 후속 설명에 따라 WSL은 별도 지원 목표로 삼지 않고, 필요한 기능이 있는 환경을 이름만으로 막지 않는 방향을 따른다.

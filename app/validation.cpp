@@ -119,7 +119,10 @@ bool Validation::flush() {
 void Validation::attachRun(const QJsonObject &run) {
     const auto id=run["run_id"].toString();if(id.isEmpty())return;
     auto refs=evidence->text().split(';',Qt::SkipEmptyParts);const auto ref="runs/"+id;
-    if(!refs.contains(ref))refs<<ref;evidence->setText(refs.join(';'));
+    if (!refs.contains(ref)) {
+        refs << ref;
+    }
+    evidence->setText(refs.join(';'));
     const auto driver=run["sdl_driver_observed"].toString();
     environmentFields["sdl_driver"]->setText(QStringList{"wayland","x11"}.contains(driver)?driver:QString());
     update();
