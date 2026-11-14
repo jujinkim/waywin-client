@@ -15,7 +15,13 @@ licenses. Keep package copyright files and upstream notices when preparing a
 redistributable binary. The current build manifest inventories key versions;
 it is not a complete release SBOM or a license audit.
 
-Qt is the approved future manager dependency and is not linked by the current
-probe. Product packaging, complete transitive license inventory and distribution
-review remain stage-3 work. No product `.deb` or Windows helper installer has been
-published.
+The Qt/C++ product dynamically links Qt 6 Core, Widgets, Network and Concurrent
+under the applicable Qt LGPLv3/GPLv3/commercial terms, and QtKeychain under its
+Modified BSD license. The legacy probe does not link Qt. Preserve the system
+packages' license texts and provide the required relinking/source information
+when distributing binaries. The additional FreeRDP product patch is maintained
+in `patches/freerdp-3.33.1-product.patch` under Apache-2.0; upstream copyrights
+remain unchanged. Product-specific build manifests record both patch hashes.
+
+Complete transitive license inventory and distribution review remain release
+work. No product `.deb` or Windows helper installer has been published.

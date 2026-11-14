@@ -1,0 +1,238 @@
+--- a/client/SDL/SDL3/sdl_context.cpp
++++ b/client/SDL/SDL3/sdl_context.cpp
+@@ -34,6 +34,9 @@
+ #include <scoped_guard.hpp>
+ 
+ #include "dialogs/sdl_dialogs.hpp"
++#include "waywin_product.hpp"
++#include <cstdio>
++#include <cstdlib>
+ #include <freerdp/client/aad_helper.h>
+ 
+ static constexpr auto sdl_allow_screensaver = "sdl-allow-screensaver";
+@@ -350,6 +353,9 @@
+ 	                        true))
+ 		return FALSE;
+ 	sdl->setConnected(true);
++	waywinStartCommands();
++	if (std::getenv("WAYWIN_PRODUCT"))
++		std::fprintf(stderr, "WAYWIN_PRODUCT_V1 connected code=0\n");
+ 	return TRUE;
+ }
+ 
+@@ -366,6 +372,9 @@
+ 
+ 	auto sdl = get_context(instance->context);
+ 	sdl->setConnected(false);
++	if (std::getenv("WAYWIN_PRODUCT"))
++		std::fprintf(stderr, "WAYWIN_PRODUCT_V1 disconnected code=%u\n",
++		             freerdp_get_last_error(instance->context));
+ 
+ 	gdi_free(instance);
+ }
+@@ -1687,6 +1696,11 @@
+ 
+ bool SdlContext::handleEvent(const SDL_Event& ev)
+ {
++    if (waywinEvent && ev.type == waywinEvent) {
++        std::unique_ptr<WayWinCommand> command(static_cast<WayWinCommand*>(ev.user.data1));
++        if (command) getRailChannelContext().productCommand(command->action, command->window, command->icon);
++        return true;
++    }
+ 	if ((ev.type >= SDL_EVENT_DISPLAY_FIRST) && (ev.type <= SDL_EVENT_DISPLAY_LAST))
+ 	{
+ 		const auto& dev = ev.display;
+--- a/client/SDL/SDL3/dialogs/sdl_dialogs.cpp
++++ b/client/SDL/SDL3/dialogs/sdl_dialogs.cpp
+@@ -412,7 +412,9 @@
+ 	size_t mlen = 0;
+ 	winpr_asprintf(&message, &mlen,
+ 	               "New Certificate details:\n"
+-	               "Common Name: %s\n"
++	               "Requested host: %s\n"
++	    "%s\n"
++	    "Common Name: %s\n"
+ 	               "Subject:     %s\n"
+ 	               "Issuer:      %s\n"
+ 	               "%s\n"
+@@ -425,7 +427,7 @@
+ 	               "connections.\n"
+ 	               "This may indicate that the certificate has been tampered with.\n"
+ 	               "Please contact the administrator of the RDP server and clarify.\n",
+-	               common_name, subject, issuer, new_fp_str, old_subject, old_issuer, old_fp_str,
++	               host, (flags & VERIFY_CERT_FLAG_MISMATCH) ? "HOST NAME MISMATCH: verify the requested server before accepting." : "Verify the certificate name and fingerprint.", common_name, subject, issuer, new_fp_str, old_subject, old_issuer, old_fp_str,
+ 	               collission_str);
+ 
+ 	const DWORD rc = sdl_show_ceritifcate_dialog(instance->context, title, message);
+@@ -461,14 +463,17 @@
+ 	size_t mlen = 0;
+ 	winpr_asprintf(
+ 	    &message, &mlen,
++	    "Requested host: %s\n"
++	    "%s\n"
+ 	    "Common Name: %s\n"
+ 	    "Subject:     %s\n"
+ 	    "Issuer:      %s\n"
+ 	    "%s\n"
++	    "Check that the requested host matches the certificate name before accepting.\n"
+ 	    "The above X.509 certificate could not be verified, possibly because you do not have\n"
+ 	    "the CA certificate in your certificate store, or the certificate has expired.\n"
+ 	    "Please look at the OpenSSL documentation on how to add a private CA to the store.\n",
+-	    common_name, subject, issuer, fp_str);
++	    host, (flags & VERIFY_CERT_FLAG_MISMATCH) ? "HOST NAME MISMATCH: verify the requested server before accepting." : "Verify the certificate name and fingerprint.", common_name, subject, issuer, fp_str);
+ 
+ 	const DWORD rc = sdl_show_ceritifcate_dialog(instance->context, title, message);
+ 	free(fp_str);
+@@ -488,8 +493,8 @@
+ 	};
+ 	const SDL_MessageBoxButtonData buttons[] = {
+ 		{ 0, BUTTONID_CERT_ACCEPT_PERMANENT, "permanent" },
+-		{ SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, BUTTONID_CERT_ACCEPT_TEMPORARY, "temporary" },
+-		{ SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, BUTTONID_CERT_DENY, "cancel" }
++		{ 0, BUTTONID_CERT_ACCEPT_TEMPORARY, "temporary" },
++		{ SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, BUTTONID_CERT_DENY, "cancel" }
+ 	};
+ 
+ 	const SDL_MessageBoxData data = { SDL_MESSAGEBOX_WARNING, nullptr, title,  message,
+--- a/libfreerdp/crypto/certificate_store.c
++++ b/libfreerdp/crypto/certificate_store.c
+@@ -151,7 +151,9 @@
+ 	if (!store)
+ 		return nullptr;
+ 
+-	const char* base = freerdp_settings_get_string(settings, FreeRDP_ConfigPath);
++	const char* base = getenv("WAYWIN_CERT_DIR");
++	if (!base || !getenv("WAYWIN_PRODUCT"))
++		base = freerdp_settings_get_string(settings, FreeRDP_ConfigPath);
+ 	if (!base)
+ 		goto fail;
+ 
+--- a/client/SDL/SDL3/sdl_rail.cpp
++++ b/client/SDL/SDL3/sdl_rail.cpp
+@@ -940,6 +940,7 @@
+ 	for (auto& kv : _windows)
+ 		kv.second.markDeleted();
+ 	_rail = nullptr;
++	_notifyIcons.clear();
+ 	_enabled = false;
+ 	/* The next connection logs on again: hold its logon desktop back too. */
+ 	_desktopReleased = false;
+@@ -966,18 +967,21 @@
+ 	window->NonMonitoredDesktop = SdlRail::non_monitored_desktop;
+ 	if (waywinProbeEnabled())
+ 	{
+-		window->NotifyIconCreate = [](rdpContext*, const WINDOW_ORDER_INFO* info,
++		window->NotifyIconCreate = [](rdpContext* context, const WINDOW_ORDER_INFO* info,
+ 		                             const NOTIFY_ICON_STATE_ORDER*) -> BOOL {
+ 			waywinProbeEvent("notify-create", info);
++			if (auto rail = SdlRail::get(context)) rail->productNotify(info->windowId, info->notifyIconId, true);
+ 			return TRUE;
+ 		};
+-		window->NotifyIconUpdate = [](rdpContext*, const WINDOW_ORDER_INFO* info,
++		window->NotifyIconUpdate = [](rdpContext* context, const WINDOW_ORDER_INFO* info,
+ 		                             const NOTIFY_ICON_STATE_ORDER*) -> BOOL {
+ 			waywinProbeEvent("notify-update", info);
++			if (auto rail = SdlRail::get(context)) rail->productNotify(info->windowId, info->notifyIconId, true);
+ 			return TRUE;
+ 		};
+-		window->NotifyIconDelete = [](rdpContext*, const WINDOW_ORDER_INFO* info) -> BOOL {
++		window->NotifyIconDelete = [](rdpContext* context, const WINDOW_ORDER_INFO* info) -> BOOL {
+ 			waywinProbeEvent("notify-delete", info);
++			if (auto rail = SdlRail::get(context)) rail->productNotify(info->windowId, info->notifyIconId, false);
+ 			return TRUE;
+ 		};
+ 	}
+@@ -2066,3 +2070,33 @@
+ 	}
+ 	return TRUE;
+ }
++
++void SdlRail::productNotify(uint32_t window, uint32_t icon, bool add)
++{
++    std::unique_lock lock(_windowsLock);
++    if (add) _notifyIcons.emplace(window, icon);
++    else _notifyIcons.erase({window, icon});
++}
++
++void SdlRail::productCommand(unsigned action, uint32_t window, uint32_t icon)
++{
++    std::unique_lock lock(_windowsLock);
++    if (!_rail || !std::getenv("WAYWIN_PRODUCT")) return;
++    if (action >= 5) {
++        if (!_notifyIcons.count({window, icon}) || !_rail->ClientNotifyEvent) return;
++        RAIL_NOTIFY_EVENT_ORDER event{};
++        event.windowId = window; event.notifyIconId = icon;
++        event.message = action == 5 ? WM_LBUTTONUP : WM_RBUTTONUP;
++        std::ignore = _rail->ClientNotifyEvent(_rail, &event);
++        return;
++    }
++    auto target = getWindow(window);
++    if (!target || !target->window()) return;
++    if (action == 1) {
++        sendSystemCommand(target, SC_RESTORE);
++        sendClientActivate(window, true);
++        SDL_RaiseWindow(target->window());
++    } else if (action == 2) sendSystemCommand(target, SC_MINIMIZE);
++    else if (action == 3) sendSystemCommand(target, SC_RESTORE);
++    else if (action == 4) sendSystemCommand(target, SC_CLOSE);
++}
+--- a/client/SDL/SDL3/sdl_rail.hpp
++++ b/client/SDL/SDL3/sdl_rail.hpp
+@@ -20,6 +20,7 @@
+ 
+ #include <cstdint>
+ #include <map>
++#include <set>
+ #include <atomic>
+ #include <mutex>
+ #include <vector>
+@@ -53,6 +54,8 @@
+ 	SdlRail& operator=(const SdlRail&) = delete;
+ 	SdlRail& operator=(SdlRail&&) = delete;
+ 
++	void productCommand(unsigned action, uint32_t window, uint32_t icon);
++	void productNotify(uint32_t window, uint32_t icon, bool add);
+ 	bool init(RailClientContext* rail);
+ 	bool uninit(RailClientContext* rail);
+ 
+@@ -220,6 +223,7 @@
+ 	static void nativeResize(void* userdata, SDL_WindowID id, int moveType, bool end);
+ 	SdlContext* _context;
+ 	RailClientContext* _rail = nullptr;
++	std::set<std::pair<uint32_t,uint32_t>> _notifyIcons;
+ 	/* Written on the RDP thread (RemoteApp mode toggles), read lock-free on the main thread. */
+ 	std::atomic<bool> _enabled = false;
+ 	bool _refreshSent = false; /* one full RefreshRect per connection, at first window realize */
+--- /dev/null
++++ b/client/SDL/SDL3/waywin_product.hpp
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <SDL3/SDL.h>
++#include <cstdio>
++#include <cstdlib>
++#include <thread>
++#include <atomic>
++#include <unistd.h>
++struct WayWinCommand { unsigned action, window, icon; };
++inline std::atomic<Uint32> waywinEvent = 0;
++inline void waywinStartCommands() {
++    if (!std::getenv("WAYWIN_PRODUCT") || waywinEvent) return;
++    waywinEvent = SDL_RegisterEvents(1);
++    std::thread([] {
++        char line[128] = {}; size_t size = 0; bool drop = false; char c = 0;
++        while (::read(STDIN_FILENO, &c, 1) == 1) {
++            if (c == '\n') {
++                line[size] = 0;
++                auto cmd = new WayWinCommand{}; char tail = 0;
++                const bool valid = !drop && std::sscanf(line, "%u %u %u %c", &cmd->action, &cmd->window, &cmd->icon, &tail) == 3 && cmd->action >= 1 && cmd->action <= 6;
++                if (valid) {
++                    SDL_Event event{}; event.type = waywinEvent; event.user.data1 = cmd;
++                    if (!SDL_PushEvent(&event)) delete cmd;
++                } else delete cmd;
++                size = 0; drop = false;
++            } else if (size < sizeof(line)-1) line[size++] = c;
++            else drop = true;
++        }
++    }).detach();
++}

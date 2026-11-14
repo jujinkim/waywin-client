@@ -22,8 +22,7 @@ Windows 시험 앱은 ICO를 실행 파일의 리소스로 포함하고, 메인 
 두 크기는 공유 캐시 없이 따로 로드하며, 클래스 아이콘 핸들은 프로세스 종료까지
 유지한다. 크기를 무시하는 공유 캐시와 종료 시 자원 해제 동작은
 [Microsoft LoadImageW 문서](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadimagew)를 따른다.
-PNG는 향후 Ubuntu 앱에서도 사용할 수 있도록 준비한 것이며, 아직 Linux 설치나
-데스크톱 진입점에 연결하지 않았다.
+Qt 제품 GUI는 256px PNG를 창/트레이 아이콘으로 사용한다. Linux 설치는 각 PNG를 hicolor 아이콘 디렉터리에 배치하며 `waywin.desktop`에서 참조한다.
 
 ## 크기별 파일 다시 만들기
 

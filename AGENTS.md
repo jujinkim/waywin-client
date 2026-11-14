@@ -1,8 +1,11 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-WayWin is in stage 0: feasibility probes for integrating Windows RDP sessions into Ubuntu GNOME Wayland. Product implementation requires real Ubuntu/Windows validation first.
+WayWin now develops the Qt/C++ product and Ubuntu/Windows validation in parallel, per the user instruction on 2026-11-14. Real-platform evidence remains required for compatibility and release claims. See `docs/product.md` for implemented and outstanding features.
 
+- `app/`: native Qt product, session worker, host settings and GUI validation reports.
+- `tests/product/`: QtTest GUI, privacy, storage and process-isolation contracts.
+- `cmake/ProductRuntime.cmake`: pinned native runtime build without Python.
 - `tools/probe.py`: Python CLI for dependency builds, environment checks, session launches, and evidence assessment.
 - `windows/probe/`: C++ Win32 test app, resources, and manifest.
 - `tests/test_probe.py`: automated probe contracts.
@@ -14,10 +17,14 @@ WayWin is in stage 0: feasibility probes for integrating Windows RDP sessions in
 Use Python 3.10+, CMake 3.22+, and Ninja. Run from the repository root:
 
 ```sh
+cmake -S . -B build/product -G Ninja -DWAYWIN_BUILD_RUNTIME=ON
+cmake --build build/product --parallel 4
+ctest --test-dir build/product --output-on-failure
+
 python3 tools/probe.py --help                 # Discover CLI operations
 python3 tools/probe.py build                  # Fetch, verify, patch, and build FreeRDP
 python3 tools/probe.py doctor                 # Check the target Wayland environment
-cmake -S . -B build/checks -G Ninja            # Configure automated checks
+cmake -S . -B build/checks -G Ninja -DWAYWIN_BUILD_APP=OFF            # Configure automated checks
 ctest --test-dir build/checks --output-on-failure
 python3 -m unittest discover -s tests -v      # Run tests directly
 ```

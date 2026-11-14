@@ -1,0 +1,43 @@
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Widgets Network Concurrent)
+find_package(Qt6Keychain REQUIRED)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${PROJECT_SOURCE_DIR}/patches/freerdp-3.33.1-product.patch"
+  "${PROJECT_SOURCE_DIR}/patches/freerdp-3.33.1-probe.patch")
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+file(SHA256 "${PROJECT_SOURCE_DIR}/patches/freerdp-3.33.1-product.patch" product_patch)
+file(SHA256 "${PROJECT_SOURCE_DIR}/patches/freerdp-3.33.1-probe.patch" probe_patch)
+add_library(waywin-core STATIC core.cpp core.h session.cpp session.h)
+target_link_libraries(waywin-core PUBLIC Qt6::Core Qt6::Network Qt6::Concurrent)
+target_include_directories(waywin-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(waywin-core PRIVATE
+  WAYWIN_FREERDP_COMMIT="65bcca1913a28cbdd7eb913599f692bd2b707991"
+  WAYWIN_PRODUCT_PATCH="${product_patch}" WAYWIN_PROBE_PATCH="${probe_patch}")
+qt_add_resources(waywin-core validation PREFIX "/validation"
+  BASE "${PROJECT_SOURCE_DIR}/docs" FILES "${PROJECT_SOURCE_DIR}/docs/feasibility-report.example.json")
+qt_add_resources(waywin-core icons PREFIX "/icons"
+  BASE "${PROJECT_SOURCE_DIR}/assets/icons" FILES "${PROJECT_SOURCE_DIR}/assets/icons/waywin-256.png")
+add_executable(waywin main.cpp window.cpp window.h validation.cpp validation.h)
+target_link_libraries(waywin PRIVATE waywin-core Qt6::Widgets qt6keychain)
+target_compile_definitions(waywin PRIVATE WAYWIN_DEFAULT_RUNTIME="${CMAKE_BINARY_DIR}/runtime/waywin-runtime.json")
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(waywin-core PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  target_compile_options(waywin PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+install(TARGETS waywin RUNTIME DESTINATION bin)
+install(FILES "${PROJECT_SOURCE_DIR}/packaging/waywin.desktop" DESTINATION share/applications)
+foreach(size IN ITEMS 16 24 32 48 64 128 256 512)
+  install(FILES "${PROJECT_SOURCE_DIR}/assets/icons/waywin-${size}.png"
+    DESTINATION "share/icons/hicolor/${size}x${size}/apps" RENAME waywin.png)
+endforeach()
+if(BUILD_TESTING)
+  find_package(Qt6 REQUIRED COMPONENTS Test)
+  add_executable(product-tests ../tests/product/test_product.cpp window.cpp window.h validation.cpp validation.h)
+  target_link_libraries(product-tests PRIVATE waywin-core Qt6::Test Qt6::Widgets qt6keychain)
+  target_compile_definitions(product-tests PRIVATE WAYWIN_DEFAULT_RUNTIME="${CMAKE_BINARY_DIR}/runtime/waywin-runtime.json" WAYWIN_EXECUTABLE="$<TARGET_FILE:waywin>" WAYWIN_TEST_PRODUCT_PATCH="${product_patch}" WAYWIN_TEST_PROBE_PATCH="${probe_patch}")
+  add_dependencies(product-tests waywin)
+  add_test(NAME product-contracts COMMAND product-tests)
+  set_tests_properties(product-contracts PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()

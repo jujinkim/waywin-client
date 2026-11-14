@@ -1,7 +1,19 @@
 cmake_minimum_required(VERSION 3.22)
-project(WayWinProbe VERSION 0.1.0 LANGUAGES CXX)
+project(WayWin VERSION 0.2.0 LANGUAGES CXX)
 
 include(CTest)
+option(WAYWIN_BUILD_APP "Build the Qt desktop product" ON)
+option(WAYWIN_BUILD_RUNTIME "Build the pinned SDL session runtime" OFF)
+if(WIN32)
+  set(WAYWIN_BUILD_APP OFF)
+endif()
+if(WAYWIN_BUILD_RUNTIME)
+  include(cmake/ProductRuntime.cmake)
+endif()
+if(WAYWIN_BUILD_APP)
+  add_subdirectory(app)
+endif()
+
 if(BUILD_TESTING)
   find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
   add_test(NAME probe-contracts

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=WayWin
+Comment=Windows workspaces and Wayland validation
+Exec=waywin
+Icon=waywin
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupNotify=true
