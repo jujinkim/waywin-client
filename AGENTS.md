@@ -49,3 +49,5 @@ History uses `feat:`, `docs:`, and `chore:` subjects. Keep commits focused and u
 
 ## Security & Agent Instructions
 Keep credentials out of arguments, logs, and reports; preserve certificate validation. On this PC, follow `/Users/jujin/.codex/RTK.md` and prefix shell commands with `rtk` or `rtk proxy`. Prefer CLI checks; use computer interaction only for necessary verification with predefined exit conditions.
+
+Product additions: windows/companion/ is the native DVC helper; protocol/ is the bounded wire contract; runtime/ is the canonical product source embedded in the FreeRDP patch. Regenerate it with tools/update_product_patch.py after synchronizing a reviewed checkout. packaging/install-linux.sh provides Ubuntu GUI installation. Keep transient images, titles, and clipboard payloads out of evidence files.

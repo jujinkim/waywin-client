@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=WayWin 설치
+Comment=Ubuntu 26.04용 WayWin 설치
+Exec=sh -c "exec \\"\\$(dirname \\"\\$1\\")/install-linux.sh\\"" sh %k
+Icon=utilities-terminal
+Terminal=false
+Categories=Network;

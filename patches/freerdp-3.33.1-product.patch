@@ -1,47 +1,15 @@
---- a/client/SDL/SDL3/sdl_context.cpp
-+++ b/client/SDL/SDL3/sdl_context.cpp
-@@ -34,6 +34,9 @@
- #include <scoped_guard.hpp>
- 
- #include "dialogs/sdl_dialogs.hpp"
-+#include "waywin_product.hpp"
-+#include <cstdio>
-+#include <cstdlib>
- #include <freerdp/client/aad_helper.h>
- 
- static constexpr auto sdl_allow_screensaver = "sdl-allow-screensaver";
-@@ -350,6 +353,9 @@
- 	                        true))
- 		return FALSE;
- 	sdl->setConnected(true);
-+	waywinStartCommands();
-+	if (std::getenv("WAYWIN_PRODUCT"))
-+		std::fprintf(stderr, "WAYWIN_PRODUCT_V1 connected code=0\n");
- 	return TRUE;
- }
- 
-@@ -366,6 +372,9 @@
- 
- 	auto sdl = get_context(instance->context);
- 	sdl->setConnected(false);
-+	if (std::getenv("WAYWIN_PRODUCT"))
-+		std::fprintf(stderr, "WAYWIN_PRODUCT_V1 disconnected code=%u\n",
-+		             freerdp_get_last_error(instance->context));
- 
- 	gdi_free(instance);
- }
-@@ -1687,6 +1696,11 @@
- 
- bool SdlContext::handleEvent(const SDL_Event& ev)
- {
-+    if (waywinEvent && ev.type == waywinEvent) {
-+        std::unique_ptr<WayWinCommand> command(static_cast<WayWinCommand*>(ev.user.data1));
-+        if (command) getRailChannelContext().productCommand(command->action, command->window, command->icon);
-+        return true;
-+    }
- 	if ((ev.type >= SDL_EVENT_DISPLAY_FIRST) && (ev.type <= SDL_EVENT_DISPLAY_LAST))
- 	{
- 		const auto& dev = ev.display;
+--- a/client/SDL/SDL3/CMakeLists.txt
++++ b/client/SDL/SDL3/CMakeLists.txt
+@@ -48,6 +48,9 @@
+     sdl_web_clip_offers.hpp
+     sdl_context.hpp
+     sdl_context.cpp
++    waywin_product.cpp
++    waywin_product.hpp
++    waywin_wire.hpp
+     sdl_rail.hpp
+     sdl_rail.cpp
+     sdl_rail_platform.hpp
 --- a/client/SDL/SDL3/dialogs/sdl_dialogs.cpp
 +++ b/client/SDL/SDL3/dialogs/sdl_dialogs.cpp
 @@ -412,7 +412,9 @@
@@ -94,45 +62,159 @@
  	};
  
  	const SDL_MessageBoxData data = { SDL_MESSAGEBOX_WARNING, nullptr, title,  message,
---- a/libfreerdp/crypto/certificate_store.c
-+++ b/libfreerdp/crypto/certificate_store.c
-@@ -151,7 +151,9 @@
- 	if (!store)
- 		return nullptr;
+--- a/client/SDL/SDL3/sdl_context.cpp
++++ b/client/SDL/SDL3/sdl_context.cpp
+@@ -34,6 +34,9 @@
+ #include <scoped_guard.hpp>
  
--	const char* base = freerdp_settings_get_string(settings, FreeRDP_ConfigPath);
-+	const char* base = getenv("WAYWIN_CERT_DIR");
-+	if (!base || !getenv("WAYWIN_PRODUCT"))
-+		base = freerdp_settings_get_string(settings, FreeRDP_ConfigPath);
- 	if (!base)
- 		goto fail;
+ #include "dialogs/sdl_dialogs.hpp"
++#include "waywin_product.hpp"
++#include <cstdio>
++#include <cstdlib>
+ #include <freerdp/client/aad_helper.h>
  
+ static constexpr auto sdl_allow_screensaver = "sdl-allow-screensaver";
+@@ -350,6 +353,9 @@
+ 	                        true))
+ 		return FALSE;
+ 	sdl->setConnected(true);
++	waywinStartCommands();
++	if (std::getenv("WAYWIN_PRODUCT"))
++		std::fprintf(stderr, "WAYWIN_PRODUCT_V1 connected code=0\n");
+ 	return TRUE;
+ }
+ 
+@@ -366,6 +372,9 @@
+ 
+ 	auto sdl = get_context(instance->context);
+ 	sdl->setConnected(false);
++	if (std::getenv("WAYWIN_PRODUCT"))
++		std::fprintf(stderr, "WAYWIN_PRODUCT_V1 disconnected code=%u\n",
++		             freerdp_get_last_error(instance->context));
+ 
+ 	gdi_free(instance);
+ }
+@@ -830,7 +839,7 @@
+ 
+ 		if (!freerdp_check_event_handles(context()))
+ 		{
+-			if (client_auto_reconnect(instance))
++			if (waywinReconnect(instance))
+ 			{
+ 				// Retry was successful, discard dialog
+ 				getDialog().show(false);
+@@ -1687,6 +1696,7 @@
+ 
+ bool SdlContext::handleEvent(const SDL_Event& ev)
+ {
++    if (waywinRecovering && ev.type < SDL_EVENT_USER && ev.type != SDL_EVENT_QUIT) return true;
+ 	if ((ev.type >= SDL_EVENT_DISPLAY_FIRST) && (ev.type <= SDL_EVENT_DISPLAY_LAST))
+ 	{
+ 		const auto& dev = ev.display;
+--- a/client/SDL/SDL3/sdl_freerdp.cpp
++++ b/client/SDL/SDL3/sdl_freerdp.cpp
+@@ -1,3 +1,4 @@
++#include "waywin_product.hpp"
+ /**
+  * FreeRDP: A Remote Desktop Protocol Implementation
+  * FreeRDP SDL UI
+@@ -168,15 +169,18 @@
+ 	{
+ 		while (!sdl->shallAbort())
+ 		{
++            waywinTick(sdl);
+ 			SDL_Event windowEvent = {};
+-			while (!sdl->shallAbort() && SDL_WaitEventTimeout(nullptr, 1000))
++			while (!sdl->shallAbort() && SDL_WaitEventTimeout(nullptr, 50))
+ 			{
+ 				/* Only poll standard SDL events and SDL_EVENT_USERS meant to create
+ 				 * dialogs. do not process the dialog return value events here.
+ 				 */
+-				const int prc = SDL_PeepEvents(&windowEvent, 1, SDL_GETEVENT, SDL_EVENT_FIRST,
++				waywinTick(sdl);
++                const int prc = SDL_PeepEvents(&windowEvent, 1, SDL_GETEVENT, SDL_EVENT_FIRST,
+ 				                               SDL_EVENT_USER_RETRY_DIALOG);
+-				if (prc < 0)
++				if (prc == 0) continue;
++                if (prc < 0)
+ 				{
+ 					if (sdl_log_error(prc, sdl->getWLog(), "SDL_PeepEvents"))
+ 						continue;
+@@ -190,10 +194,12 @@
+ 					continue;
+ 
+ 				/* Still handle a quit, it cancels the session */
+-				if (sdl->shallAbort(true) && (windowEvent.type != SDL_EVENT_QUIT))
++				if (!waywinRecovering && sdl->shallAbort(true) && (windowEvent.type != SDL_EVENT_QUIT))
+ 					continue;
+ 
+-				if (!sdl->handleEvent(windowEvent))
++				if (waywinInput(windowEvent)) continue;
++                if (waywinRecovering && windowEvent.type == SDL_EVENT_USER_UPDATE && !sdl->isConnected()) continue;
++                if (!sdl->handleEvent(windowEvent))
+ 					throw ErrorMsg{ -1, windowEvent.type, "sdl->handleEvent" };
+ 
+ 				switch (windowEvent.type)
+@@ -621,6 +627,7 @@
+ 	std::unique_ptr<sdl_rdp_context, void (*)(sdl_rdp_context*)> sdl_rdp(
+ 	    reinterpret_cast<sdl_rdp_context*>(freerdp_client_context_new(&clientEntryPoints)),
+ 	    context_free);
++    waywinRegister();
+ 
+ 	if (!sdl_rdp)
+ 		return -1;
 --- a/client/SDL/SDL3/sdl_rail.cpp
 +++ b/client/SDL/SDL3/sdl_rail.cpp
-@@ -940,6 +940,7 @@
- 	for (auto& kv : _windows)
- 		kv.second.markDeleted();
+@@ -1,3 +1,4 @@
++#include "waywin_product.hpp"
+ /**
+  * FreeRDP: A Remote Desktop Protocol Implementation
+  * SDL3 Client RAIL (RemoteApp Integrated Locally)
+@@ -922,7 +923,7 @@
+ 	/* The caller clears rail->custom next; server callbacks return early on nullptr. */
+ 	std::unique_lock lock(_windowsLock);
+ 	_refreshSent = false;
+-	_appStarted = false;
++	if (!waywinRecovering) _appStarted = false;
+ 	/* Reset session and move state on reconnect. */
+ 	_localMove = {};
+ 	_sessionMargins = {};
+@@ -937,9 +938,15 @@
+ 	/* Mark windows for main-thread teardown. */
+ 	WLog_DBG(TAG, "RAIL channel uninit, marking %zu windows for main-thread teardown",
+ 	         _windows.size());
+-	for (auto& kv : _windows)
+-		kv.second.markDeleted();
++	if (!waywinRecovering) {
++        for (auto& kv : _windows) kv.second.markDeleted();
++    } else {
++        _productPending.clear();_productRetireAt=0;
++        for (const auto& kv : _windows) _productPending.insert(kv.first);
++    }
  	_rail = nullptr;
 +	_notifyIcons.clear();
++    _notifyVersions.clear();
  	_enabled = false;
  	/* The next connection logs on again: hold its logon desktop back too. */
  	_desktopReleased = false;
-@@ -966,18 +967,21 @@
+@@ -966,18 +973,21 @@
  	window->NonMonitoredDesktop = SdlRail::non_monitored_desktop;
  	if (waywinProbeEnabled())
  	{
 -		window->NotifyIconCreate = [](rdpContext*, const WINDOW_ORDER_INFO* info,
+-		                             const NOTIFY_ICON_STATE_ORDER*) -> BOOL {
 +		window->NotifyIconCreate = [](rdpContext* context, const WINDOW_ORDER_INFO* info,
- 		                             const NOTIFY_ICON_STATE_ORDER*) -> BOOL {
++		                             const NOTIFY_ICON_STATE_ORDER* state) -> BOOL {
  			waywinProbeEvent("notify-create", info);
-+			if (auto rail = SdlRail::get(context)) rail->productNotify(info->windowId, info->notifyIconId, true);
++			if (auto rail = SdlRail::get(context)) { rail->productNotify(info->windowId, info->notifyIconId, true); rail->productNotifyData(info,state); }
  			return TRUE;
  		};
 -		window->NotifyIconUpdate = [](rdpContext*, const WINDOW_ORDER_INFO* info,
+-		                             const NOTIFY_ICON_STATE_ORDER*) -> BOOL {
 +		window->NotifyIconUpdate = [](rdpContext* context, const WINDOW_ORDER_INFO* info,
- 		                             const NOTIFY_ICON_STATE_ORDER*) -> BOOL {
++		                             const NOTIFY_ICON_STATE_ORDER* state) -> BOOL {
  			waywinProbeEvent("notify-update", info);
-+			if (auto rail = SdlRail::get(context)) rail->productNotify(info->windowId, info->notifyIconId, true);
++			if (auto rail = SdlRail::get(context)) { rail->productNotify(info->windowId, info->notifyIconId, true); rail->productNotifyData(info,state); }
  			return TRUE;
  		};
 -		window->NotifyIconDelete = [](rdpContext*, const WINDOW_ORDER_INFO* info) -> BOOL {
@@ -142,7 +224,44 @@
  			return TRUE;
  		};
  	}
-@@ -2066,3 +2070,33 @@
+@@ -1017,6 +1027,7 @@
+ 
+ 	if (execResult->execResult != RAIL_EXEC_S_OK)
+ 	{
++        WayWinWire::Message fault{WayWinWire::Fault,0,0,{}};WayWinWire::put(fault.data,execResult->execResult);waywinEmit(std::move(fault));
+ 		WLog_ERR(TAG, "RAIL exec error: execResult=0x%04" PRIx16 " rawResult=0x%08" PRIx32,
+ 		         execResult->execResult, execResult->rawResult);
+ 		freerdp_abort_connect_context(rail->_context->context());
+@@ -1772,6 +1783,7 @@
+ 
+ 	const UINT32 fieldFlags = orderInfo->fieldFlags;
+ 	std::unique_lock lock(rail->_windowsLock);
++    rail->_productPending.erase(orderInfo->windowId);
+ 	auto appWindow = rail->getWindow(orderInfo->windowId);
+ 
+ 	if (fieldFlags & WINDOW_ORDER_STATE_NEW)
+@@ -1780,7 +1792,7 @@
+ 			                    static_cast<int>(windowState->windowOffsetY),
+ 			                    static_cast<int>(windowState->windowWidth),
+ 			                    static_cast<int>(windowState->windowHeight) };
+-		appWindow = rail->addWindow(orderInfo->windowId, rect);
++		if (!appWindow) appWindow = rail->addWindow(orderInfo->windowId, rect);
+ 		if (!appWindow)
+ 			return FALSE;
+ 
+@@ -1849,7 +1861,10 @@
+ 		char* title = rail_string_to_utf8_string(&windowState->titleInfo);
+ 		if (title)
+ 		{
+-			appWindow->setTitle(title);
++			const auto prefix = freerdp_settings_get_string(context->settings, FreeRDP_WindowTitle);
++            appWindow->setTitle(std::string(prefix ? prefix : "WayWin") + " · " + title);
++            WayWinWire::Message event{WayWinWire::Title,orderInfo->windowId,0,{}};
++            WayWinWire::put(event.data,0);WayWinWire::string(event.data,std::string(title).substr(0,4096));waywinEmit(std::move(event));
+ 			free(title);
+ 		}
+ 	}
+@@ -2066,3 +2081,71 @@
  	}
  	return TRUE;
  }
@@ -151,7 +270,7 @@
 +{
 +    std::unique_lock lock(_windowsLock);
 +    if (add) _notifyIcons.emplace(window, icon);
-+    else _notifyIcons.erase({window, icon});
++    else { _notifyIcons.erase({window, icon}); _notifyVersions.erase({window,icon}); }
 +}
 +
 +void SdlRail::productCommand(unsigned action, uint32_t window, uint32_t icon)
@@ -162,7 +281,8 @@
 +        if (!_notifyIcons.count({window, icon}) || !_rail->ClientNotifyEvent) return;
 +        RAIL_NOTIFY_EVENT_ORDER event{};
 +        event.windowId = window; event.notifyIconId = icon;
-+        event.message = action == 5 ? WM_LBUTTONUP : WM_RBUTTONUP;
++        const bool modern = _notifyVersions[{window,icon}] >= 3;
++        event.message = action == 5 ? (modern ? NIN_SELECT : WM_LBUTTONUP) : (modern ? WM_CONTEXTMENU : WM_RBUTTONUP);
 +        std::ignore = _rail->ClientNotifyEvent(_rail, &event);
 +        return;
 +    }
@@ -176,6 +296,43 @@
 +    else if (action == 3) sendSystemCommand(target, SC_RESTORE);
 +    else if (action == 4) sendSystemCommand(target, SC_CLOSE);
 +}
++
++void SdlRail::productTick()
++{
++    std::unique_lock lock(_windowsLock);
++    if (waywinRecovering || _productPending.empty()) return;
++    if (!_productRetireAt) _productRetireAt=SDL_GetTicks()+3000;
++    if (SDL_GetTicks()<_productRetireAt) return;
++    for (auto id:_productPending) {
++        auto target=getWindow(id);
++        if(target) target->markDeleted();
++        WINDOW_ORDER_INFO info{};info.windowId=id;waywinProbeEvent("window-delete",&info);
++    }
++    _productPending.clear();_productRetireAt=0;
++}
++void SdlRail::productNotifyData(const WINDOW_ORDER_INFO*info,const NOTIFY_ICON_STATE_ORDER*state)
++{
++    if(!std::getenv("WAYWIN_PRODUCT"))return;
++    std::unique_lock lock(_windowsLock);
++    if(info->fieldFlags&WINDOW_ORDER_FIELD_NOTIFY_VERSION)_notifyVersions[{info->windowId,info->notifyIconId}]=state->version;
++    if(info->fieldFlags&WINDOW_ORDER_FIELD_NOTIFY_TIP) {
++        char*text=rail_string_to_utf8_string(&state->toolTip);
++        if(text) {
++            WayWinWire::Message m{WayWinWire::TrayTitle,info->windowId,0,{}};
++            WayWinWire::put(m.data,info->notifyIconId);WayWinWire::string(m.data,std::string(text).substr(0,4096));waywinEmit(std::move(m));free(text);
++        }
++    }
++    SdlRailIcon decoded;SdlRailIcon*icon=nullptr;
++    if(info->fieldFlags&WINDOW_ORDER_ICON) {
++        if(state->icon.width>256||state->icon.height>256||!convertRailIcon(&state->icon,decoded))return;
++        icon=iconCacheLookup(state->icon.cacheId,state->icon.cacheEntry);
++        if(icon)*icon=decoded;else icon=&decoded;
++    } else if(info->fieldFlags&WINDOW_ORDER_CACHED_ICON)icon=iconCacheLookup(state->cachedIcon.cacheId,state->cachedIcon.cacheEntry);
++    if(!icon||icon->bgra.empty()||icon->w>256||icon->h>256)return;
++    WayWinWire::Message m{WayWinWire::Icon,info->windowId,0,{}};
++    WayWinWire::put(m.data,info->notifyIconId);WayWinWire::put(m.data,icon->w);WayWinWire::put(m.data,icon->h);
++    m.data.insert(m.data.end(),icon->bgra.begin(),icon->bgra.end());waywinEmit(std::move(m));
++}
 --- a/client/SDL/SDL3/sdl_rail.hpp
 +++ b/client/SDL/SDL3/sdl_rail.hpp
 @@ -20,6 +20,7 @@
@@ -186,53 +343,381 @@
  #include <atomic>
  #include <mutex>
  #include <vector>
-@@ -53,6 +54,8 @@
+@@ -53,6 +54,10 @@
  	SdlRail& operator=(const SdlRail&) = delete;
  	SdlRail& operator=(SdlRail&&) = delete;
  
 +	void productCommand(unsigned action, uint32_t window, uint32_t icon);
 +	void productNotify(uint32_t window, uint32_t icon, bool add);
++    void productNotifyData(const WINDOW_ORDER_INFO*, const NOTIFY_ICON_STATE_ORDER*);
++    void productTick();
  	bool init(RailClientContext* rail);
  	bool uninit(RailClientContext* rail);
  
-@@ -220,6 +223,7 @@
+@@ -220,6 +225,10 @@
  	static void nativeResize(void* userdata, SDL_WindowID id, int moveType, bool end);
  	SdlContext* _context;
  	RailClientContext* _rail = nullptr;
 +	std::set<std::pair<uint32_t,uint32_t>> _notifyIcons;
++    std::map<std::pair<uint32_t,uint32_t>,uint32_t> _notifyVersions;
++    std::set<uint32_t> _productPending;
++    Uint64 _productRetireAt = 0;
  	/* Written on the RDP thread (RemoteApp mode toggles), read lock-free on the main thread. */
  	std::atomic<bool> _enabled = false;
  	bool _refreshSent = false; /* one full RefreshRect per connection, at first window realize */
+--- a/client/SDL/SDL3/sdl_window.cpp
++++ b/client/SDL/SDL3/sdl_window.cpp
+@@ -1,3 +1,4 @@
++#include "waywin_product.hpp"
+ /**
+  * FreeRDP: A Remote Desktop Protocol Implementation
+  * SDL Client
+@@ -87,10 +88,11 @@
+ 
+ SdlWindow::~SdlWindow()
+ {
++    waywinForget(_renderer);
+ 	if (_gdiTexture)
+ 		SDL_DestroyTexture(_gdiTexture);
+ 	if (_renderTarget)
+-		SDL_DestroyTexture(_renderTarget);
++		{ waywinForget(_renderer); SDL_DestroyTexture(_renderTarget); }
+ 	if (_renderer)
+ 		SDL_DestroyRenderer(_renderer);
+ 	if (_window)
+@@ -295,7 +297,7 @@
+ 			return;
+ 		if (static_cast<int>(tw) == w && static_cast<int>(th) == h)
+ 			return;
+-		SDL_DestroyTexture(_renderTarget);
++		{ waywinForget(_renderer); SDL_DestroyTexture(_renderTarget); }
+ 	}
+ 
+ 	_renderTarget =
+@@ -659,6 +661,7 @@
+ 		return;
+ 	if (!SDL_RenderTexture(_renderer, _renderTarget, nullptr, nullptr))
+ 		return;
++	waywinTrack(_window, _renderer, _renderTarget);
+ 	if (!SDL_RenderPresent(_renderer))
+ 		return;
+ }
+@@ -743,6 +746,7 @@
+ 	if (!SDL_SetRenderTarget(_renderer, nullptr))
+ 		return false;
+ 	std::ignore = SDL_RenderTexture(_renderer, _renderTarget, nullptr, nullptr);
++	waywinTrack(_window, _renderer, _renderTarget);
+ 	std::ignore = SDL_RenderPresent(_renderer);
+ 	return true;
+ }
 --- /dev/null
-+++ b/client/SDL/SDL3/waywin_product.hpp
-@@ -0,0 +1,30 @@
++++ b/client/SDL/SDL3/waywin_product.cpp
+@@ -0,0 +1,218 @@
 +// SPDX-License-Identifier: Apache-2.0
-+#pragma once
-+#include <SDL3/SDL.h>
++#include "waywin_product.hpp"
++#include "sdl_context.hpp"
++#include <freerdp/dvc.h>
++#include <freerdp/client/channels.h>
++#include <freerdp/error.h>
++#include <winpr/stream.h>
++#include <winpr/synch.h>
 +#include <cstdio>
 +#include <cstdlib>
++#include <cstring>
 +#include <thread>
-+#include <atomic>
++#include <mutex>
++#include <condition_variable>
++#include <deque>
++#include <map>
++#include <sstream>
++#include <random>
++#include <chrono>
 +#include <unistd.h>
-+struct WayWinCommand { unsigned action, window, icon; };
-+inline std::atomic<Uint32> waywinEvent = 0;
-+inline void waywinStartCommands() {
-+    if (!std::getenv("WAYWIN_PRODUCT") || waywinEvent) return;
-+    waywinEvent = SDL_RegisterEvents(1);
-+    std::thread([] {
-+        char line[128] = {}; size_t size = 0; bool drop = false; char c = 0;
-+        while (::read(STDIN_FILENO, &c, 1) == 1) {
-+            if (c == '\n') {
-+                line[size] = 0;
-+                auto cmd = new WayWinCommand{}; char tail = 0;
-+                const bool valid = !drop && std::sscanf(line, "%u %u %u %c", &cmd->action, &cmd->window, &cmd->icon, &tail) == 3 && cmd->action >= 1 && cmd->action <= 6;
-+                if (valid) {
-+                    SDL_Event event{}; event.type = waywinEvent; event.user.data1 = cmd;
-+                    if (!SDL_PushEvent(&event)) delete cmd;
-+                } else delete cmd;
-+                size = 0; drop = false;
-+            } else if (size < sizeof(line)-1) line[size++] = c;
-+            else drop = true;
++using namespace WayWinWire;
++std::atomic<bool> waywinRecovering{false};
++std::atomic<unsigned> waywinEpoch{100u+(std::random_device{}()&0x3fffffffu)};
++static std::atomic<unsigned> retryAction{0},retryAttempt{0},retrySeconds{0};
++static std::atomic<Uint64> recoveryStart{0};
++static std::atomic<bool> readerStarted{false},retryPaused{false};
++static std::mutex commandsLock,channelLock,outputLock;
++struct Command {unsigned action,window,icon,epoch;std::string payload;};
++static std::deque<Command> commands;
++static IWTSVirtualChannel* activeChannel=nullptr;
++struct Picture {SDL_Window*window;SDL_Texture*texture;};
++static std::map<SDL_Renderer*,Picture> pictures;
++void waywinEmit(Message m) {
++    if(!std::getenv("WAYWIN_PRODUCT"))return;
++    if(!m.epoch)m.epoch=waywinEpoch.load();
++    auto line=std::string("WAYWIN_UI_V2 ")+hex(encode(m))+"\n";
++    std::lock_guard<std::mutex>lock(outputLock);
++    // One stdio lock prevents interleaving with FreeRDP diagnostics.
++    std::fwrite(line.data(),1,line.size(),stderr);std::fflush(stderr);
++}
++struct Callback {IWTSVirtualChannelCallback iface{};IWTSVirtualChannel*channel=nullptr;Decoder decoder;unsigned epoch=0;};
++static UINT received(IWTSVirtualChannelCallback* base,wStream* stream) {
++    auto*c=reinterpret_cast<Callback*>(base);
++    try {for(auto m:c->decoder.feed(static_cast<const uint8_t*>(Stream_ConstPointer(stream)),Stream_GetRemainingLength(stream))) {
++        if(m.type<Ready||m.type>SurfaceGone||m.epoch!=c->epoch)continue;
++        waywinEmit(std::move(m));
++    }}catch(...){return ERROR_INVALID_DATA;}
++    return CHANNEL_RC_OK;
++}
++static UINT opened(IWTSVirtualChannelCallback*base) {
++    auto*c=reinterpret_cast<Callback*>(base);
++    {std::lock_guard<std::mutex>lock(channelLock);activeChannel=c->channel;c->epoch=++waywinEpoch;}
++    Message state{Channel,0,c->epoch,{}};put(state.data,1);waywinEmit(std::move(state));
++    auto hello=encode({Hello,1,c->epoch,{}});
++    return c->channel->Write(c->channel,static_cast<ULONG>(hello.size()),hello.data(),nullptr);
++}
++static UINT closed(IWTSVirtualChannelCallback*base) {
++    auto*c=reinterpret_cast<Callback*>(base);
++    {std::lock_guard<std::mutex>lock(channelLock);if(activeChannel==c->channel)activeChannel=nullptr;}
++    Message state{Channel,0,c->epoch,{}};put(state.data,0);waywinEmit(std::move(state));delete c;return CHANNEL_RC_OK;
++}
++struct Plugin {IWTSPlugin iface{};IWTSListenerCallback listener{};};
++static UINT newChannel(IWTSListenerCallback*,IWTSVirtualChannel*channel,BYTE*,BOOL*accept,IWTSVirtualChannelCallback**out) {
++    auto*c=new Callback;c->channel=channel;c->iface.OnDataReceived=received;c->iface.OnOpen=opened;c->iface.OnClose=closed;
++    *accept=TRUE;*out=&c->iface;return CHANNEL_RC_OK;
++}
++static UINT initialize(IWTSPlugin*base,IWTSVirtualChannelManager*manager) {
++    auto*p=reinterpret_cast<Plugin*>(base);p->listener.OnNewChannelConnection=newChannel;
++    IWTSListener*listener=nullptr;return manager->CreateListener(manager,"WayWin",0,&p->listener,&listener);
++}
++static UINT terminate(IWTSPlugin*base){delete reinterpret_cast<Plugin*>(base);return CHANNEL_RC_OK;}
++static UINT VCAPITYPE entry(IDRDYNVC_ENTRY_POINTS*points) {
++    auto*p=new Plugin;p->iface.Initialize=initialize;p->iface.Terminated=terminate;
++    UINT rc=points->RegisterPlugin(points,"waywin",&p->iface);if(rc!=CHANNEL_RC_OK)delete p;return rc;
++}
++static PVIRTUALCHANNELENTRY provider(LPCSTR name,LPCSTR subsystem,LPCSTR type,DWORD flags) {
++    if(name&&std::strcmp(name,"waywin")==0) {
++        // FreeRDP's provider ABI uses a static-channel function pointer for DVC entries.
++        PDVC_PLUGIN_ENTRY dvc=entry;PVIRTUALCHANNELENTRY out=nullptr;
++        static_assert(sizeof(out)==sizeof(dvc));std::memcpy(&out,&dvc,sizeof(out));return out;
++    }
++    return freerdp_channels_load_static_addin_entry(name,subsystem,type,flags);
++}
++void waywinRegister(){if(std::getenv("WAYWIN_PRODUCT"))std::ignore=freerdp_register_addin_provider(provider,0);}
++void waywinStartCommands() {
++    if(!std::getenv("WAYWIN_PRODUCT")||readerStarted.exchange(true))return;
++    std::thread([]{
++        std::string line;bool drop=false;char c=0;
++        while(::read(STDIN_FILENO,&c,1)==1) {
++            if(c=='\n') {
++                if(!drop) {
++                    std::istringstream input(line);Command cmd{};std::string extra;
++                    if((input>>cmd.action>>cmd.window>>cmd.icon>>cmd.epoch>>cmd.payload)&&!(input>>extra)) {
++                        if(cmd.action==21||cmd.action==22||cmd.action==23)retryAction=cmd.action;
++                        else {std::lock_guard<std::mutex>lock(commandsLock);if(commands.size()<128)commands.push_back(std::move(cmd));}
++                    }
++                }
++                line.clear();drop=false;
++            }else if(line.size()<2*(Maximum+24)+128)line+=c;else drop=true;
 +        }
 +    }).detach();
 +}
++void waywinTrack(SDL_Window*w,SDL_Renderer*r,SDL_Texture*t){
++    if(!std::getenv("WAYWIN_PRODUCT"))return;
++    pictures[r]={w,t};unsigned color=0x7651c9;
++    if(const char*accent=std::getenv("WAYWIN_ACCENT")){if(std::strlen(accent)==7&&accent[0]=='#')color=static_cast<unsigned>(std::strtoul(accent+1,nullptr,16));}
++    int width=0,height=0;SDL_GetRenderOutputSize(r,&width,&height);
++    SDL_FRect stripe{0,0,static_cast<float>(width),3};
++    std::ignore=SDL_SetRenderDrawColor(r,static_cast<Uint8>(color>>16),static_cast<Uint8>(color>>8),static_cast<Uint8>(color),255);
++    std::ignore=SDL_RenderFillRect(r,&stripe);
++}
++void waywinForget(SDL_Renderer*r){pictures.erase(r);}
++static void retryStatus(unsigned,unsigned,unsigned,unsigned);
++static void overlay() {
++    if(!waywinRecovering||SDL_GetTicks()-recoveryStart<500)return;
++    for(auto&[renderer,picture]:pictures) {
++        if(!picture.window||!picture.texture)continue;
++        int w=0,h=0;SDL_GetRenderOutputSize(renderer,&w,&h);
++        std::ignore=SDL_SetRenderTarget(renderer,nullptr);
++        std::ignore=SDL_RenderTexture(renderer,picture.texture,nullptr,nullptr);
++        std::ignore=SDL_SetRenderDrawBlendMode(renderer,SDL_BLENDMODE_BLEND);
++        std::ignore=SDL_SetRenderDrawColor(renderer,0,0,0,170);
++        std::ignore=SDL_RenderFillRect(renderer,nullptr);
++        if(w>=240) {
++            std::ignore=SDL_SetRenderDrawColor(renderer,255,255,255,255);
++            const auto title=SDL_GetWindowTitle(picture.window);
++            const std::string text=std::string(title?title:"WayWin").substr(0,80)+"\nConnection interrupted\nAttempt "+std::to_string(retryAttempt.load())+"/5  wait "+std::to_string(retrySeconds.load())+"s";
++            const float x=static_cast<float>(std::max(12,(w-220)/2)),y=static_cast<float>(std::max(12,(h-100)/2));
++            std::ignore=SDL_RenderDebugText(renderer,x,y,text.c_str());
++            SDL_FRect button{x,y+60,208,28};
++            std::ignore=SDL_SetRenderDrawColor(renderer,75,60,135,255);std::ignore=SDL_RenderFillRect(renderer,&button);
++            std::ignore=SDL_SetRenderDrawColor(renderer,255,255,255,255);
++            std::ignore=SDL_RenderDebugText(renderer,x+12,y+70,retryPaused?"Retry connection":"Cancel retries");
++        }
++        std::ignore=SDL_RenderPresent(renderer);
++    }
++}
++bool waywinInput(const SDL_Event&ev) {
++    if(!waywinRecovering)return false;
++    if(ev.type==SDL_EVENT_WINDOW_CLOSE_REQUESTED){retryStatus(4,retryAttempt,0,0);return true;}
++    if(ev.type==SDL_EVENT_MOUSE_BUTTON_UP){
++        auto window=SDL_GetWindowFromID(ev.button.windowID);int w=0,h=0,lw=0,lh=0;
++        if(window){SDL_GetWindowSizeInPixels(window,&w,&h);SDL_GetWindowSize(window,&lw,&lh);}
++        const float px=ev.button.x*static_cast<float>(w)/static_cast<float>(std::max(1,lw));
++        const float py=ev.button.y*static_cast<float>(h)/static_cast<float>(std::max(1,lh));
++        const int x=std::max(12,(w-220)/2),y=std::max(12,(h-100)/2)+60;
++        if(w>=240&&px>=x&&px<x+208&&py>=y&&py<y+28)retryAction=retryPaused?21:22;
++        return true;
++    }
++    return (ev.type>=SDL_EVENT_KEY_DOWN&&ev.type<=SDL_EVENT_TEXT_EDITING_CANDIDATES)||
++        (ev.type>=SDL_EVENT_MOUSE_MOTION&&ev.type<=SDL_EVENT_MOUSE_WHEEL)||
++        (ev.type>=SDL_EVENT_FINGER_DOWN&&ev.type<=SDL_EVENT_FINGER_CANCELED);
++}
++void waywinTick(SdlContext*sdl) {
++    if(!std::getenv("WAYWIN_PRODUCT"))return;
++    std::deque<Command>pending;{std::lock_guard<std::mutex>lock(commandsLock);pending.swap(commands);}
++    for(const auto&c:pending) {
++        if(c.epoch!=waywinEpoch||waywinRecovering)continue;
++        if(c.action>=1&&c.action<=6)sdl->getRailChannelContext().productCommand(c.action,c.window,c.icon);
++        else if(c.action==20)try {
++            auto bytes=unhex(c.payload);Decoder decoder;auto messages=decoder.feed(bytes.data(),bytes.size());
++            if(messages.size()!=1||encode(messages[0])!=bytes||!requestType(messages[0].type)||messages[0].epoch!=waywinEpoch)continue;
++            std::lock_guard<std::mutex>lock(channelLock);
++            if(activeChannel)std::ignore=activeChannel->Write(activeChannel,static_cast<ULONG>(bytes.size()),bytes.data(),nullptr);
++        }catch(...){}
++    }
++    sdl->getRailChannelContext().productTick();
++    overlay();
++}
++static bool networkFailure(freerdp*instance) {
++    const auto info=freerdp_error_info(instance),error=freerdp_get_last_error(instance->context);
++    if(info!=ERRINFO_SUCCESS&&info!=ERRINFO_GRAPHICS_SUBSYSTEM_FAILED)return false;
++    return error==FREERDP_ERROR_SUCCESS||error==FREERDP_ERROR_CONNECT_TRANSPORT_FAILED||
++        error==FREERDP_ERROR_CONNECT_FAILED||error==FREERDP_ERROR_DNS_NAME_NOT_FOUND||
++        error==FREERDP_ERROR_DNS_ERROR;
++}
++static void retryStatus(unsigned state,unsigned attempt,unsigned seconds,unsigned error) {
++    Message m{Retry,0,waywinEpoch.load(),{}};put(m.data,state);put(m.data,attempt);put(m.data,seconds);put(m.data,error);waywinEmit(std::move(m));
++}
++bool waywinReconnect(freerdp*instance) {
++    if(!std::getenv("WAYWIN_PRODUCT"))return client_auto_reconnect(instance);
++    if(!networkFailure(instance))return false;
++    waywinRecovering=true;retryPaused=false;recoveryStart=SDL_GetTicks();retryAction=0;++waywinEpoch;
++    // Never replay RemoteApplicationProgram after the initial connection.
++    std::ignore=freerdp_settings_set_string(instance->context->settings,FreeRDP_RemoteApplicationProgram,"");
++    std::mt19937 random(std::random_device{}());
++    unsigned attempt=0;
++    for(;;) {
++        if(retryAction==22||attempt>=5) {
++            retryPaused=true;retryAttempt=5;retrySeconds=0;retryStatus(2,attempt,0,freerdp_get_last_error(instance->context));
++            while(retryAction!=21&&retryAction!=23) {
++                if(freerdp_get_last_error(instance->context)==FREERDP_ERROR_CONNECT_CANCELLED){waywinRecovering=false;return false;}
++                std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            }
++            attempt=0;retryPaused=false;
++        }
++        bool immediate=retryAction==21||retryAction==23;retryAction=0;
++        retryAttempt=++attempt;
++        auto milliseconds=immediate?0:static_cast<unsigned>((1u<<(attempt-1))*std::uniform_int_distribution<int>(800,1200)(random));
++        auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(milliseconds);
++        while(std::chrono::steady_clock::now()<deadline) {
++            if(retryAction)break;
++            retrySeconds=static_cast<unsigned>(std::chrono::duration_cast<std::chrono::seconds>(deadline-std::chrono::steady_clock::now()).count()+1);
++            retryStatus(1,attempt,retrySeconds,0);std::this_thread::sleep_for(std::chrono::milliseconds(250));
++        }
++        if(retryAction==22)continue;
++        if(retryAction==21||retryAction==23){attempt=0;continue;}
++        if(freerdp_get_last_error(instance->context)==FREERDP_ERROR_CONNECT_CANCELLED){waywinRecovering=false;return false;}
++        retrySeconds=0;retryStatus(1,attempt,0,0);
++        std::mutex lock;std::condition_variable done;bool finished=false;std::atomic<bool> timedOut{false};
++        std::thread watchdog([&]{std::unique_lock<std::mutex>guard(lock);if(!done.wait_for(guard,std::chrono::seconds(9),[&]{return finished;})){timedOut=true;std::ignore=freerdp_abort_connect_context(instance->context);}});
++        const bool connected=freerdp_reconnect(instance);
++        {std::lock_guard<std::mutex>guard(lock);finished=true;}done.notify_one();watchdog.join();
++        if(connected){{std::lock_guard<std::mutex>guard(commandsLock);commands.clear();}waywinRecovering=false;retryStatus(0,attempt,0,0);return true;}
++        if(timedOut)freerdp_set_last_error(instance->context,FREERDP_ERROR_CONNECT_TRANSPORT_FAILED);
++        if(!networkFailure(instance)){retryStatus(3,attempt,0,freerdp_get_last_error(instance->context));waywinRecovering=false;return false;}
++    }
++}
+--- /dev/null
++++ b/client/SDL/SDL3/waywin_product.hpp
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <SDL3/SDL.h>
++#include <freerdp/freerdp.h>
++#include <atomic>
++#include "waywin_wire.hpp"
++class SdlContext;
++extern std::atomic<bool> waywinRecovering;
++extern std::atomic<unsigned> waywinEpoch;
++void waywinStartCommands();
++void waywinRegister();
++void waywinTick(SdlContext*);
++bool waywinInput(const SDL_Event&);
++bool waywinReconnect(freerdp*);
++void waywinTrack(SDL_Window*,SDL_Renderer*,SDL_Texture*);
++void waywinForget(SDL_Renderer*);
++void waywinEmit(WayWinWire::Message);
+--- /dev/null
++++ b/client/SDL/SDL3/waywin_wire.hpp
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <cstdint>
++#include <string>
++#include <vector>
++#include <stdexcept>
++#include <algorithm>
++namespace WayWinWire {
++constexpr uint32_t Magic=0x32575759, Maximum=2*1024*1024;
++enum Type : uint32_t { Hello=1, Apps=2, Launch=3, Shell=4, ClipboardGet=5, ClipboardSet=6,
++    Pointer=7, Key=8, SurfaceClose=9, Text=10,
++    Ready=101, AppList=102, Result=103, Frame=104, Clipboard=105, SurfaceGone=106,
++    Channel=107, Title=108, Icon=109, Retry=110, Fault=111, TrayTitle=112 };
++struct Message { uint32_t type=0,request=0,epoch=0;std::vector<uint8_t> data; };
++inline void put(std::vector<uint8_t>&b,uint32_t n){for(int i=0;i<4;++i)b.push_back(uint8_t(n>>(8*i)));}
++inline uint32_t get(const uint8_t*p){return uint32_t(p[0])|(uint32_t(p[1])<<8)|(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24);}
++inline void string(std::vector<uint8_t>&b,const std::string&s){put(b,uint32_t(s.size()));b.insert(b.end(),s.begin(),s.end());}
++class Reader {
++    const std::vector<uint8_t>&b;size_t p=0;
++public:
++    explicit Reader(const std::vector<uint8_t>&bytes):b(bytes){}
++    uint32_t number(){if(b.size()-p<4)throw std::runtime_error("truncated field");auto n=get(b.data()+p);p+=4;return n;}
++    std::string text(size_t max=65536){auto n=number();if(n>max||n>b.size()-p)throw std::runtime_error("invalid text");std::string s(b.begin()+p,b.begin()+p+n);p+=n;return s;}
++    bool done()const{return p==b.size();}
++    size_t position()const{return p;}
++};
++inline bool requestType(uint32_t t){return t>=Hello&&t<=Text;}
++inline bool responseType(uint32_t t){return t>=Ready&&t<=TrayTitle;}
++inline std::vector<uint8_t> encode(const Message&m){
++    if(m.data.size()>Maximum)throw std::runtime_error("oversized frame");
++    std::vector<uint8_t>b;b.reserve(24+m.data.size());put(b,Magic);put(b,2);put(b,m.type);put(b,m.request);put(b,m.epoch);put(b,uint32_t(m.data.size()));b.insert(b.end(),m.data.begin(),m.data.end());return b;
++}
++class Decoder {
++    std::vector<uint8_t> buffer;
++public:
++    void reset(){buffer.clear();}
++    std::vector<Message> feed(const uint8_t*p,size_t n){
++        if(n>Maximum+24||buffer.size()+n>2*(Maximum+24)){reset();throw std::runtime_error("buffer limit");}
++        buffer.insert(buffer.end(),p,p+n);std::vector<Message>out;size_t off=0;
++        while(buffer.size()-off>=24){const auto*h=buffer.data()+off;auto size=get(h+20);
++            if(get(h)!=Magic||get(h+4)!=2||size>Maximum){reset();throw std::runtime_error("protocol mismatch");}
++            if(buffer.size()-off<24+size)break;
++            out.push_back({get(h+8),get(h+12),get(h+16),{h+24,h+24+size}});off+=24+size;
++        }
++        buffer.erase(buffer.begin(),buffer.begin()+off);return out;
++    }
++};
++inline std::string hex(const std::vector<uint8_t>&b){const char*d="0123456789abcdef";std::string s;s.reserve(b.size()*2);for(auto c:b){s+=d[c>>4];s+=d[c&15];}return s;}
++inline std::vector<uint8_t> unhex(const std::string&s){
++    if(s.size()%2||s.size()>2*(Maximum+24))throw std::runtime_error("invalid hex length");
++    std::vector<uint8_t>b;b.reserve(s.size()/2);int nibble=-1;
++    for(char c:s){int n=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:-1;if(n<0)throw std::runtime_error("invalid hex");if(nibble<0)nibble=n;else{b.push_back(uint8_t(nibble*16+n));nibble=-1;}}return b;
++}
++}
+--- a/libfreerdp/crypto/certificate_store.c
++++ b/libfreerdp/crypto/certificate_store.c
+@@ -151,7 +151,9 @@
+ 	if (!store)
+ 		return nullptr;
+ 
+-	const char* base = freerdp_settings_get_string(settings, FreeRDP_ConfigPath);
++	const char* base = getenv("WAYWIN_CERT_DIR");
++	if (!base || !getenv("WAYWIN_PRODUCT"))
++		base = freerdp_settings_get_string(settings, FreeRDP_ConfigPath);
+ 	if (!base)
+ 		goto fail;
+ 

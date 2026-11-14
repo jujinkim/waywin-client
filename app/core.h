@@ -13,6 +13,7 @@ struct Host {
     QJsonObject json() const;
     static Host fromJson(const QJsonObject &o);
     QString validate() const;
+    QString accent() const;
 };
 QString endpoint(const QString &input, QString *error = nullptr);
 QStringList arguments(const Host &host, bool launch);

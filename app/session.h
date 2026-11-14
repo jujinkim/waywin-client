@@ -5,9 +5,13 @@
 #include <QProcess>
 #include <QFile>
 #include <QSet>
+#include <QMap>
+#include "../protocol/waywin_wire.hpp"
+class ProductTests;
 namespace WayWin {
 class Session : public QObject {
     Q_OBJECT
+    friend class ::ProductTests;
 public:
     explicit Session(const Host &host, const QString &dataRoot, QObject *parent=nullptr);
     ~Session() override;
@@ -16,24 +20,48 @@ public:
     QString driver;
     QSet<quint32> windows;
     QSet<quint64> icons;
+    QMap<quint32,QString> windowTitles;
+    QMap<quint64,QByteArray> trayImages;
+    QMap<quint64,QString> trayTitles;
+    QString companionIdentity,companionStatus="Windows 보조 앱을 기다리고 있습니다.";
+    quint32 epoch=1;
+    bool companionReady=false;
+    bool surfaceProxy=false;
     bool active() const;
     void start(const QString &binary, QByteArray password, bool launch);
     void stop();
     void inject(const QString &action);
     void command(unsigned action, quint32 window, quint32 icon = 0);
+    quint32 request(quint32 type,const std::vector<uint8_t>& data={});
+    void recovery(unsigned action);
     QJsonObject summary() const;
 signals:
     void changed();
     void ended();
+    void transient(const QByteArray &bytes);
+    void companionChanged();
+    void crashRecoveryRequested();
+    void closeRequested();
 private:
     QString root;
+    QString beforePause;
     QProcess worker;
+    QProcess surfaceWorker;
+    WayWinWire::Decoder surfaceCommands;
     QByteArray pending;
     QFile events;
     qint64 pid=0;
     bool stopping=false, failed=false;
     int count=0;
     bool truncated=false;
+    quint32 nextRequest=10;
+    QMap<quint32,qint64> requests;
+    QSet<quint32> inputRequests;
+    unsigned crashRestarts=0;
+    bool channelReady=false;
+    qint64 lastHeartbeat=0;
+    void receiveTransient(const QByteArray &bytes);
+    void forwardSurface(const QByteArray &bytes);
     void receive();
     void record(QJsonObject event);
     void finish(int code, QProcess::ExitStatus status);

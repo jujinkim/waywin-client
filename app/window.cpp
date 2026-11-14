@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "window.h"
+#include "companion.h"
+#include <QImage>
 #include "validation.h"
 #include <QApplication>
 #include <QCheckBox>
@@ -75,7 +77,7 @@ Window::Window(const QString &dataRoot,QWidget *parent):QMainWindow(parent) {
     auto overview=new QWidget;auto overviewLayout=new QVBoxLayout(overview);
     auto description=new QLabel("인증서는 접속 창에서 이름과 지문을 확인하세요. 여러 호스트를 동시에 연결할 수 있습니다.\n개별 창은 Windows의 RemoteApp 허용 설정이 필요합니다.");description->setWordWrap(true);overviewLayout->addWidget(description);
     windows=new QListWidget;overviewLayout->addWidget(new QLabel("수신된 원격 창·알림 아이콘"));overviewLayout->addWidget(windows);
-    auto capability=new QLabel("원격 창·알림 아이콘을 선택해 아래 버튼으로 조작하세요. 원본 아이콘 이미지는 아직 전송하지 않으며 ID로 표시합니다. 원본 셸·작업 보존은 검증 탭에서 실제 결과를 기록하세요.");capability->setWordWrap(true);overviewLayout->addWidget(capability);
+    auto capability=new QLabel("원격 창·알림 아이콘을 선택해 아래 버튼으로 조작하세요. 창 제목과 원본 알림 아이콘은 이 호스트에서 수신한 정보입니다.");capability->setWordWrap(true);overviewLayout->addWidget(capability);
     auto remoteActions=new QHBoxLayout;overviewLayout->addLayout(remoteActions);
     int actionId=0;
     for(const auto &label:QStringList{"창 활성화","최소화","복원","창 닫기","아이콘 클릭","아이콘 메뉴"}) {
@@ -98,6 +100,9 @@ Window::Window(const QString &dataRoot,QWidget *parent):QMainWindow(parent) {
     auto monitors=new QPushButton("SDL 화면 ID 조회");setupLayout->addWidget(monitors);
     auto folder=new QPushButton("기록 폴더 열기");setupLayout->addWidget(folder);
     auto help=new QLabel("검증 순서: 환경 점검 → 호스트 추가 → 전체 데스크톱 연결 → Windows 시험 앱 실행 → 개별 창 재접속 → 검증 항목 기록 → 보고서 내보내기.\nWindows 시험 앱의 Documents / Tray / Windows shell 메뉴에서 시험 동작을 실행합니다.");help->setWordWrap(true);setupLayout->addWidget(help);setupLayout->addStretch();tabs->addTab(setup,"환경·도움말");
+    companion=new Companion;tabs->addTab(companion,"Windows 앱·셸·클립보드");
+    auto recoveryBar=new QHBoxLayout;overviewLayout->addLayout(recoveryBar);
+    for(const auto &entry:QList<QPair<QString,unsigned>>{{"즉시 재시도",21},{"자동 재시도 중단",22}}){auto button=new QPushButton(entry.first);recoveryBar->addWidget(button);connect(button,&QPushButton::clicked,this,[this,entry]{auto h=selected();if(h&&sessions.contains(h->id))sessions[h->id]->recovery(entry.second);});}
     auto test=menuBar()->addMenu("검증 도구");
     for(const auto &pair:QList<QPair<QString,QString>>{{"선택 세션 일시 정지","pause"},{"선택 세션 재개","resume"},{"선택 세션 강제 종료","crash"}}) {
         auto action=test->addAction(pair.first);connect(action,&QAction::triggered,this,[this,pair]{auto h=selected();if(!h)return;auto s=sessions.value(h->id);if(!s||!s->active())return;if(pair.second=="crash" && QMessageBox::question(this,"장애 시험",h->name+"의 로컬 세션 프로세스를 강제 종료할까요?")!=QMessageBox::Yes)return;s->inject(pair.second);});
@@ -125,14 +130,15 @@ void Window::showError(const QString &error){statusBar()->showMessage(error);QMe
 bool Window::save(){if(!configWritable)return false;QJsonArray a;for(const auto &h:hosts)a.append(h.json());QString e;if(!saveJson(root+"/hosts.json",{{"schema",1},{"runtime",runtime},{"hosts",a}},&e)){showError(e);return false;}return true;}
 void Window::refresh(){
     auto h=selected();auto s=h?sessions.value(h->id):nullptr;
-    for(int i=0;i<hosts.size();++i){auto session=sessions.value(hosts[i].id);list->item(i)->setText(hosts[i].name+"\n"+(busy.contains(hosts[i].id)?"준비 중":session?session->state:"연결 안 됨"));}
+    for(int i=0;i<hosts.size();++i){auto session=sessions.value(hosts[i].id);list->item(i)->setText(hosts[i].name+"\n"+(busy.contains(hosts[i].id)?"준비 중":session?session->state:"연결 안 됨"));QPixmap badge(12,12);badge.fill(QColor(hosts[i].accent()));list->item(i)->setIcon(QIcon(badge));}
+    companion->setSession(s);
     title->setText(h?h->name:"호스트를 추가하세요");state->setText(s?s->state:"연결 안 됨");detail->setText(s?s->detail:"호스트 설정 후 연결을 누르세요.");
     const bool pending=h&&busy.contains(h->id),active=s&&s->active();
     connectButton->setEnabled(h&&!active&&!pending&&configWritable);disconnectButton->setEnabled(active);
     editButton->setEnabled(h&&!active&&!pending&&configWritable);deleteButton->setEnabled(h&&!active&&!pending&&configWritable);validation->setEnabled(h!=nullptr);
     const auto selectedItem=windows->currentItem();const auto selectedId=selectedItem?selectedItem->data(Qt::UserRole):QVariant();const auto selectedTray=selectedItem?selectedItem->data(Qt::UserRole+1):QVariant();windows->clear();
-    if(s){for(auto id:s->windows){auto item=new QListWidgetItem("창 ID "+QString::number(id),windows);item->setData(Qt::UserRole,QVariant::fromValue(quint64(id)));item->setData(Qt::UserRole+1,false);}
-        for(auto id:s->icons){auto item=new QListWidgetItem("알림 아이콘 "+QString::number(id>>32)+":"+QString::number(quint32(id)),windows);item->setData(Qt::UserRole,QVariant::fromValue(id));item->setData(Qt::UserRole+1,true);}}
+    if(s){for(auto id:s->windows){auto item=new QListWidgetItem(s->windowTitles.value(id,"창 ID "+QString::number(id)),windows);item->setData(Qt::UserRole,QVariant::fromValue(quint64(id)));item->setData(Qt::UserRole+1,false);}
+        for(auto id:s->icons){auto item=new QListWidgetItem(s->trayTitles.value(id,"알림 아이콘 "+QString::number(id>>32)+":"+QString::number(quint32(id))),windows);item->setData(Qt::UserRole,QVariant::fromValue(id));item->setData(Qt::UserRole+1,true);auto bytes=s->trayImages.value(id);if(bytes.size()>36){const auto p=reinterpret_cast<const uchar*>(bytes.constData()+24);const auto w=WayWinWire::get(p+4),h=WayWinWire::get(p+8);QImage image(p+12,int(w),int(h),int(w*4),QImage::Format_ARGB32);item->setIcon(QPixmap::fromImage(image.copy()));}}}
     for(int i=0;i<windows->count();++i){auto item=windows->item(i);if(item->data(Qt::UserRole)==selectedId&&item->data(Qt::UserRole+1)==selectedTray)windows->setCurrentItem(item);}
     runtimeLabel->setText("세션 엔진: "+runtime);
 }
@@ -148,7 +154,7 @@ void Window::editHost(bool create){
     QSpinBox width,height;width.setRange(200,8192);height.setRange(200,8192);width.setValue(h.width);height.setValue(h.height);form->addRow("창 너비",&width);form->addRow("창 높이",&height);
     QComboBox depth;for(int n:{16,24,32})depth.addItem(QString::number(n),n);depth.setCurrentIndex(depth.findData(h.depth));form->addRow("색 깊이",&depth);
     QCheckBox multi("전체 데스크톱도 다중 화면 사용"),dynamic("화면 변경 전달"),sound("원격 소리 재생"),remember("비밀번호를 OS 키링에 저장");multi.setChecked(h.multimon);dynamic.setChecked(h.dynamic);sound.setChecked(h.sound);remember.setChecked(h.remember);form->addRow(&multi);form->addRow(&dynamic);form->addRow(&sound);form->addRow(&remember);
-    auto info=new QLabel("비밀번호는 연결 시 입력합니다. 클립보드 공유는 호스트 간 전달을 막기 위해 현재 꺼져 있습니다.");info->setWordWrap(true);form->addRow(info);
+    auto info=new QLabel("비밀번호는 연결 시 입력합니다. 클립보드는 Windows 앱·셸·클립보드 탭에서 선택한 호스트와만 수동 전송합니다.");info->setWordWrap(true);form->addRow(info);
     QDialogButtonBox buttons(QDialogButtonBox::Save|QDialogButtonBox::Cancel);form->addRow(&buttons);connect(&buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
     connect(&buttons,&QDialogButtonBox::accepted,&dialog,[&]{
         auto o=h.json();for(auto it=fields.begin();it!=fields.end();++it)o[it.key()]=it.value()->text().trimmed();h=Host::fromJson(o);
@@ -174,9 +180,12 @@ void Window::connectHost(bool reconnect){
     auto old=sessions.value(h.id);
     if(old&&old->active()){
         if(!reconnect)return;
-        auto once=std::make_shared<QMetaObject::Connection>();*once=connect(old,&Session::ended,this,[this,id=h.id,once]{disconnect(*once);auto current=selected();if(current&&current->id==id)connectHost(true);});old->stop();return;
+        auto once=std::make_shared<QMetaObject::Connection>();*once=connect(old,&Session::ended,this,[this,h,once]{disconnect(*once);if(!closing)connectTarget(h,false);});old->stop();return;
     }
     bool launchApp=!reconnect&&launch->isChecked()&&h.mode=="rail";
+    connectTarget(h,launchApp);
+}
+void Window::connectTarget(const Host&h,bool launchApp){
     auto error=h.validate();if(!error.isEmpty()){showError(error);return;}if(launchApp&&h.app.isEmpty()){showError("호스트 설정에 RemoteApp 별칭·경로를 입력하세요.");return;}
     if(!environment()["target_ready"].toBool()){tabs->setCurrentIndex(2);showError("실제 접속은 Ubuntu 26.04 GNOME Wayland에서 실행하세요.");return;}
     busy.insert(h.id);refresh();
@@ -199,9 +208,13 @@ void Window::authenticate(const Host &h,const QString &binary,bool launchApp){
 }
 void Window::begin(const Host &h,const QString &binary,QByteArray password,bool launchApp){
     busy.remove(h.id);if(password.size()>1000||password.contains('\n')||password.contains('\r')||password.contains('\0')){password.fill('\0');showError("저장된 인증 정보 형식이 올바르지 않습니다. 저장 비밀번호를 삭제하고 다시 입력하세요.");refresh();return;}if(closing){password.fill('\0');return;}
-    auto s=sessions.value(h.id);if(s&&s->active()){password.fill('\0');return;}delete sessions.take(h.id);
-    s=new Session(h,root,this);sessions[h.id]=s;connect(s,&Session::changed,this,&Window::refresh);
-    connect(s,&Session::ended,this,[this]{refresh();if(closing)QTimer::singleShot(0,this,&QWidget::close);});s->start(binary,password,launchApp);password.fill('\0');refresh();
+    auto s=sessions.value(h.id);if(s&&s->active()){password.fill('\0');return;}
+    if(!s){s=new Session(h,root,this);sessions[h.id]=s;connect(s,&Session::changed,this,&Window::refresh);
+        connect(s,&Session::ended,this,[this]{refresh();if(closing)QTimer::singleShot(0,this,&QWidget::close);});
+        connect(s,&Session::crashRecoveryRequested,this,[this,s]{if(!closing&&!s->active())connectTarget(s->host,false);});
+        connect(s,&Session::closeRequested,this,[this,s]{if(QMessageBox::question(this,"연결 해제",s->host.name+"의 연결을 해제하고 원격 창을 닫을까요?") == QMessageBox::Yes)s->stop();});
+    }
+    s->host=h;s->start(binary,password,launchApp);password.fill('\0');refresh();
 }
 void Window::switchMode(){
     auto h=selected();if(!h)return;auto s=sessions.value(h->id);if(s&&s->active()){

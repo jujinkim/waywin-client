@@ -6,7 +6,7 @@
     "commit": "65bcca1913a28cbdd7eb913599f692bd2b707991",
     "license": "Apache-2.0",
     "probe_patch_sha256": "839bad68c19b57ba87a18672f883ea0425e2db5d887a26cfebbf6ec368626c02",
-    "product_patch_sha256": "89496aac94b8012ce8608a7c3439655ceb77374c1506ce55a4609f6e89617098"
+    "product_patch_sha256": "089d8d5ed3f7f8df61544c84440943266547ac86e2cbf3add14a88bc6c7f1f86"
   },
   "system_dependencies": "Exact resolved versions are recorded per build in build-manifest.json; see docs/validation.md. This is not a hermetic distribution lock."
 }

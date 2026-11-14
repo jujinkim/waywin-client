@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(WayWin VERSION 0.2.0 LANGUAGES CXX)
+project(WayWin VERSION 0.3.0 LANGUAGES CXX)
 
 include(CTest)
 option(WAYWIN_BUILD_APP "Build the Qt desktop product" ON)
@@ -23,4 +23,6 @@ endif()
 if(WIN32)
   enable_language(RC)
   add_subdirectory(windows/probe)
+  add_subdirectory(windows/companion)
 endif()
+include(cmake/ProductPackaging.cmake)

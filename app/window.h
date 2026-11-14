@@ -12,6 +12,7 @@ class QCheckBox;
 class QCloseEvent;
 namespace WayWin {
 class Validation;
+class Companion;
 class Window : public QMainWindow {
     Q_OBJECT
 public:
@@ -30,6 +31,7 @@ private:
     QPushButton *connectButton,*disconnectButton,*editButton,*deleteButton;
     QTabWidget *tabs;
     Validation *validation;
+    Companion *companion;
     bool closing=false,configWritable=true;
     Host *selected();
     bool save();
@@ -37,6 +39,7 @@ private:
     void editHost(bool create);
     void removeHost();
     void connectHost(bool reconnect=false);
+    void connectTarget(const Host&,bool launchApp);
     void authenticate(const Host &host,const QString &binary,bool launchApp);
     void begin(const Host &host,const QString &binary,QByteArray password,bool launchApp);
     void showError(const QString &error);

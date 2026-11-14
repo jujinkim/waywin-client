@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core.h"
+#include "../protocol/waywin_wire.hpp"
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDirIterator>
@@ -91,7 +92,7 @@ QString Host::validate() const {
 }
 QStringList arguments(const Host &h, bool launch) {
     QStringList a{"/v:"+endpoint(h.server),"/u:"+h.user,"/t:["+h.name+"] WayWin",
-        "/from-stdin:force","/sec:rdp:off","/proxy:ignore","/log-level:ERROR","-auto-reconnect",
+        "/from-stdin:force","/sec:rdp:off","/proxy:ignore","/log-level:ERROR","+auto-reconnect","/dvc:waywin",
         "-clipboard","/timeout:9000","/bpp:"+QString::number(h.depth)};
     if (!h.domain.isEmpty()) a << "/d:"+h.domain;
     a << (h.sound ? "/sound" : "/audio-mode:2");
@@ -102,6 +103,10 @@ QStringList arguments(const Host &h, bool launch) {
     a << (h.dynamic ? "+dynamic-resolution" : "-dynamic-resolution");
     if (h.mode=="rail") a << "/app:program:"+(launch ? h.app : QString());
     return a;
+}
+QString Host::accent() const {
+    const auto hash=QCryptographicHash::hash(id.toUtf8(),QCryptographicHash::Sha256);
+    return QStringList{"#7651c9","#187a9d","#bb5a24","#30804b","#b34472","#6166bc"}.at(uchar(hash[0])%6);
 }
 QProcessEnvironment sessionEnvironment(const QString &certDir) {
     auto env=QProcessEnvironment::systemEnvironment();
@@ -181,6 +186,14 @@ QString verifyRuntime(const QString &manifest,QString *error,QJsonObject *metada
     return binary;
 }
 QJsonObject parseEvent(const QByteArray &line) {
+    if(line.startsWith("WAYWIN_UI_V2 ") && line.endsWith('\n')) {
+        try {
+            auto hex=line.mid(13,line.size()-14);auto bytes=WayWinWire::unhex(hex.toStdString());
+            WayWinWire::Decoder decoder;auto messages=decoder.feed(bytes.data(),bytes.size());
+            if(messages.size()!=1 || WayWinWire::encode(messages[0])!=bytes || !WayWinWire::responseType(messages[0].type))return {};
+            return {{"type","ui"},{"payload",QString::fromLatin1(hex)}};
+        }catch(...){return {};}
+    }
     const QString s=QString::fromLatin1(line);
     auto m=QRegularExpression("^WAYWIN_PROBE_V1 driver=(wayland|x11|cocoa|windows)\\n$").match(s);
     if(m.hasMatch())return {{"type","driver"},{"driver",m.captured(1)}};
@@ -200,7 +213,8 @@ QList<QJsonObject> EventDecoder::feed(const QByteArray &chunk) {
             pending.clear();dropping=false;
         } else if(!dropping) {
             pending+=c;
-            if(pending.size()>512){pending.clear();dropping=true;}
+            const auto limit=pending.startsWith("WAYWIN_UI_V2 ")?2*(WayWinWire::Maximum+24)+16:512;
+            if(pending.size()>limit){pending.clear();dropping=true;}
         }
     }
     return result;

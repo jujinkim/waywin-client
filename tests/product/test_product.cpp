@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core.h"
+#include "companion.h"
 #include "window.h"
 #include "validation.h"
 #include <QListWidget>
@@ -16,6 +17,8 @@
 #include <QCryptographicHash>
 #include <QTemporaryDir>
 #include <QFile>
+#include <QBuffer>
+#include <QImage>
 #include <QUuid>
 #include <QProcess>
 #include <QSignalSpy>
@@ -136,6 +139,79 @@ private slots:
         QVERIFY(file.open(QIODevice::WriteOnly));file.write("fixture");file.close();
         QFile extra(temp.filePath("libextra.so"));QVERIFY(extra.open(QIODevice::WriteOnly));extra.write("unlisted");extra.close();QVERIFY(WayWin::verifyRuntime(manifest,&error).isEmpty());extra.remove();
         QTemporaryDir outside;QFile external(outside.filePath("engine"));QVERIFY(external.open(QIODevice::WriteOnly));external.write("fixture");external.close();QFile::remove(binary);QVERIFY(QFile::link(external.fileName(),binary));QVERIFY(WayWin::verifyRuntime(manifest,&error).isEmpty());
+    }
+
+
+    void surfaceWorkersTerminateOnEof(){
+        using namespace WayWinWire;
+        QImage image(40,30,QImage::Format_RGB32);image.fill(Qt::blue);QByteArray jpeg;QBuffer buffer(&jpeg);buffer.open(QIODevice::WriteOnly);QVERIFY(image.save(&buffer,"JPEG"));
+        Message frame{Frame,1,10,{}};put(frame.data,1);put(frame.data,40);put(frame.data,30);
+        frame.data.insert(frame.data.end(),reinterpret_cast<const uint8_t*>(jpeg.constData()),reinterpret_cast<const uint8_t*>(jpeg.constData()+jpeg.size()));
+        auto bytes=encode(frame);QProcess a,b;
+        for(auto p:{&a,&b}){p->start(QStringLiteral(WAYWIN_EXECUTABLE),{"--surface-worker","Test host"});QVERIFY(p->waitForStarted());p->write(reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size()));}
+        QTest::qWait(200);
+        a.closeWriteChannel();QVERIFY(a.waitForFinished(5000));QCOMPARE(a.exitCode(),0);
+        QCOMPARE(b.state(),QProcess::Running);const auto output=a.readAllStandardOutput();
+        b.closeWriteChannel();QVERIFY(b.waitForFinished(5000));QCOMPARE(b.exitCode(),0);
+        Decoder decoder;auto commands=decoder.feed(reinterpret_cast<const uint8_t*>(output.constData()),size_t(output.size()));
+        for(const auto&message:commands)QVERIFY(message.type==Pointer||message.type==Key||message.type==SurfaceClose);
+        QVERIFY(!output.contains(jpeg)); // The worker returns commands, never the image payload.
+    }
+    void binaryProtocolBoundaries(){
+        using namespace WayWinWire;
+        Message input{Clipboard,42,9,{}};string(input.data,"private clipboard");auto bytes=encode(input);
+        Decoder decoder;std::vector<Message> messages;
+        for(auto b:bytes){auto part=decoder.feed(&b,1);messages.insert(messages.end(),part.begin(),part.end());}
+        QCOMPARE(messages.size(),size_t(1));QCOMPARE(messages[0].request,42u);QCOMPARE(messages[0].epoch,9u);
+        Reader read(messages[0].data);QCOMPARE(read.text(),std::string("private clipboard"));QVERIFY(read.done());
+        QCOMPARE(unhex(hex(bytes)),bytes);
+        auto bad=bytes;bad[4]=3;QVERIFY_THROWS_EXCEPTION(std::runtime_error,decoder.feed(bad.data(),bad.size()));
+        bad=bytes;bad[20]=0xff;bad[21]=0xff;bad[22]=0xff;QVERIFY_THROWS_EXCEPTION(std::runtime_error,decoder.feed(bad.data(),bad.size()));
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error,unhex("01xz"));
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error,unhex("1"));
+        std::vector<uint8_t> empty;Reader truncated(empty);QVERIFY_THROWS_EXCEPTION(std::runtime_error,truncated.number());
+    }
+    void transientDataIsNotEvidence(){
+        using namespace WayWinWire;
+        QTemporaryDir temp;WayWin::Host host;host.id="host-a";host.name="A";WayWin::Session session(host,temp.path());
+        session.events.setFileName(temp.filePath("events.jsonl"));QVERIFY(session.events.open(QIODevice::WriteOnly));
+        session.runId="run-a";
+        Message title{Title,77,1,{}};put(title.data,0);string(title.data,"CONFIDENTIAL_DOCUMENT");
+        auto bytes=encode(title);auto line=QByteArray::fromStdString("WAYWIN_UI_V2 "+hex(bytes)+"\n");
+        WayWin::EventDecoder filter;auto event=filter.feed(line);QCOMPARE(event.size(),1);QCOMPARE(event[0]["type"].toString(),QString("ui"));
+        session.receiveTransient(QByteArray(reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size())));
+        QCOMPARE(session.windowTitles.value(77),QString("CONFIDENTIAL_DOCUMENT"));
+        title.type=TrayTitle;bytes=encode(title);session.receiveTransient(QByteArray(reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size())));
+        QCOMPARE(session.trayTitles.value(quint64(77)<<32),QString("CONFIDENTIAL_DOCUMENT")); // Icon ID zero is valid.
+        title.type=Title;
+        Message recovery{Retry,0,2,{}};for(auto n:{1,2,4,0})put(recovery.data,uint32_t(n));bytes=encode(recovery);
+        session.receiveTransient(QByteArray(reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size())));
+        QCOMPARE(session.state,QString("재연결 중"));QCOMPARE(session.epoch,2u);
+        title.request=78;bytes=encode(title);session.receiveTransient(QByteArray(reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size())));
+        QVERIFY(!session.windowTitles.contains(78)); // Previous generation is discarded.
+        session.events.close();QFile log(temp.filePath("events.jsonl"));QVERIFY(log.open(QIODevice::ReadOnly));auto evidence=log.readAll();
+        QVERIFY(evidence.contains("recovery"));QVERIFY(!evidence.contains("CONFIDENTIAL"));QVERIFY(!evidence.contains("payload"));
+    }
+    void hostScopedCompanionAndClipboard(){
+        using namespace WayWinWire;
+        QTemporaryDir temp;WayWin::Host host;host.id="a";host.name="A";WayWin::Session a(host,temp.path());host.id="b";WayWin::Session b(host,temp.path());
+        QSignalSpy aMessages(&a,&WayWin::Session::transient),bMessages(&b,&WayWin::Session::transient);
+        Message clip{Clipboard,30,1,{}};string(clip.data,"host A only");
+        auto bytes=encode(clip);auto data=QByteArray(reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size()));
+        a.receiveTransient(data);QCOMPARE(aMessages.size(),0); // Unsolicited clipboard is rejected.
+        a.requests[30]=QDateTime::currentMSecsSinceEpoch()+1000;
+        a.receiveTransient(data);QCOMPARE(aMessages.size(),1);QCOMPARE(bMessages.size(),0);QVERIFY(!b.companionReady);
+        Message ready{Ready,1,1,{}};put(ready.data,4);string(ready.data,"instance-a");put(ready.data,0x3f);bytes=encode(ready);
+        a.receiveTransient(QByteArray(reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size())));
+        QVERIFY(a.companionReady);QCOMPARE(a.companionIdentity,QString("4:instance-a"));
+        ready.data.clear();put(ready.data,5);string(ready.data,"instance-b");put(ready.data,0x3f);ready.epoch=2;bytes=encode(ready);
+        a.receiveTransient(QByteArray(reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size())));
+        QVERIFY(a.detail.contains("변경"));QVERIFY(b.companionIdentity.isEmpty());
+        WayWin::Companion panel;panel.setSession(&a);panel.show();
+        Message appList{AppList,31,2,{}};put(appList.data,1);put(appList.data,7);string(appList.data,"Remote editor");
+        a.requests[31]=QDateTime::currentMSecsSinceEpoch()+1000;bytes=encode(appList);a.receiveTransient(QByteArray(reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size())));
+        QCOMPARE(panel.findChild<QListWidget*>("remoteApps")->count(),1);
+        panel.setSession(&b);QCOMPARE(panel.findChild<QListWidget*>("remoteApps")->count(),0);
     }
     void rejectUntrustedManifest(){QTemporaryDir temp;auto f=temp.filePath("waywin-runtime.json");QVERIFY(WayWin::saveJson(f,{{"schema",2}},nullptr));QString error;QVERIFY(WayWin::verifyRuntime(f,&error).isEmpty());QVERIFY(!error.isEmpty());}
 };
