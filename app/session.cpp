@@ -49,6 +49,8 @@ Session::~Session() {
 bool Session::active() const {return worker.state()!=QProcess::NotRunning;}
 void Session::start(const QString &binary,QByteArray password,bool launch) {
     if(active())return;
+    expectedDrivers=displayDrivers(QProcessEnvironment::systemEnvironment(),host.displayBackend);
+    if(expectedDrivers.isEmpty()){password.fill('\0');state="실패";detail="선택한 화면 연결 방식을 사용할 수 없습니다. 호스트 설정과 그래픽 세션을 확인하세요.";emit changed();return;}
     runId=QUuid::createUuid().toString(QUuid::WithoutBraces);
     runDirectory=privateDirectory(root+"/runs/"+runId);
     const auto certDir=privateDirectory(root+"/certificates/"+host.id);
@@ -57,12 +59,12 @@ void Session::start(const QString &binary,QByteArray password,bool launch) {
     windowTitles.clear();trayTitles.clear();trayImages.clear();requests.clear();companionReady=false;channelReady=false;epoch=1;
     QJsonObject run{{"schema","waywin-run-1"},{"run_id",runId},{"host_id",host.id},
         {"started",QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
-        {"mode",host.mode},{"program_start_requested",launch && host.mode=="rail"},{"environment",environment()}};
+        {"mode",host.mode},{"program_start_requested",launch && host.mode=="rail"},{"environment",environment(host.displayBackend)}};
     QString error;
     if(!saveJson(runDirectory+"/run.json",run,&error)) {state="실패";detail=error;emit changed();return;}
     events.setFileName(runDirectory+"/events.jsonl");
     if(!events.open(QIODevice::WriteOnly|QIODevice::NewOnly) || !events.setPermissions(QFile::ReadOwner|QFile::WriteOwner)) {state="실패";detail="이벤트 기록을 열 수 없습니다.";emit changed();return;}
-    auto processEnvironment=sessionEnvironment(certDir);processEnvironment.insert("WAYWIN_ACCENT",host.accent());worker.setProcessEnvironment(processEnvironment);
+    auto processEnvironment=sessionEnvironment(certDir,host.displayBackend);processEnvironment.insert("WAYWIN_ACCENT",host.accent());worker.setProcessEnvironment(processEnvironment);
     state="연결 중"; detail="인증 및 서버 연결을 기다리고 있습니다.";
     worker.setProgram(QCoreApplication::applicationFilePath());
     worker.setArguments(QStringList{"--session-worker",binary}+arguments(host,launch));
@@ -72,7 +74,7 @@ void Session::start(const QString &binary,QByteArray password,bool launch) {
 }
 void Session::stop() {
     if(!active())return;
-    stopping=true;state="연결 해제 중";detail="세션 프로세스를 정리하고 있습니다.";
+    stopping=true;state="연결 해제 중";if(!failed)detail="세션 프로세스를 정리하고 있습니다.";
     worker.closeWriteChannel();emit changed();
 }
 void Session::inject(const QString &action) {
@@ -107,7 +109,7 @@ void Session::forwardSurface(const QByteArray&bytes) {
         auto env=QProcessEnvironment::systemEnvironment();
         env.insert("WAYWIN_ACCENT",host.accent());
 #ifdef Q_OS_LINUX
-        env.insert("QT_QPA_PLATFORM","wayland");
+        env.insert("QT_QPA_PLATFORM",driver=="x11"?"xcb":"wayland");
         const auto parent=::getpid();surfaceWorker.setChildProcessModifier([parent]{if(::prctl(PR_SET_PDEATHSIG,SIGKILL)!=0||::getppid()!=parent)::_exit(125);});
 #endif
         surfaceWorker.setProcessEnvironment(env);surfaceWorker.start();
@@ -169,8 +171,11 @@ void Session::receive() {
         if(type=="process") {pid=static_cast<qint64>(event["pid"].toDouble());continue;}
         if(type=="driver") {
             driver=event["driver"].toString();
-            if(driver!="wayland") {failed=true;detail="네이티브 Wayland 드라이버가 아닙니다. GNOME Wayland로 로그인하세요.";stop();}
-        } else if(type=="connected" && !stopping) {state="연결됨";detail="원격 화면에서 입력과 창 동작을 확인하세요.";}
+            if(!expectedDrivers.contains(driver)) {failed=true;detail="선택한 방식과 다른 화면 드라이버입니다. 호스트 설정과 세션 엔진을 확인하세요.";stop();}
+        } else if(type=="connected" && !stopping) {
+            if(!expectedDrivers.contains(driver)){failed=true;detail="실제 화면 드라이버를 확인하지 못했습니다. 세션 엔진 설치를 확인하세요.";stop();}
+            else {state="연결됨";detail="화면 연결: "+driver+" · 원격 화면에서 입력과 창 동작을 확인하세요.";}
+        }
         else if(type=="disconnected" && !stopping && !failed) {state="연결 끊김";detail="인증·인증서·서버 상태를 확인한 뒤 다시 연결하세요. 오류 코드: "+QString::number(event["code"].toDouble(),'f',0);}
         else if(type=="window-create")windows.insert(event["window"].toDouble());
         else if(type=="window-delete")windows.remove(event["window"].toDouble());
@@ -187,7 +192,8 @@ QJsonObject Session::summary() const {
 void Session::finish(int code,QProcess::ExitStatus status) {
     receive();
     state=stopping && !failed ? "연결 해제됨" : (status==QProcess::NormalExit && code==0 && !failed ? "세션 종료됨" : "연결 실패");
-    if(!stopping && (status!=QProcess::NormalExit || code!=0) && !failed && !detail.contains("오류 코드"))detail="연결에 실패했습니다. 주소·계정·인증서와 서버 상태를 확인하고 다시 연결하세요.";
+    if(!stopping && (status!=QProcess::NormalExit || code!=0) && !failed && !detail.contains("오류 코드"))
+        detail=driver.isEmpty()?"화면 드라이버를 초기화하지 못했거나 엔진이 시작되지 않았습니다. 화면 연결 설정·서버 접근 권한·엔진 설치를 확인하세요.":"연결에 실패했습니다. 주소·계정·인증서와 서버 상태를 확인하고 다시 연결하세요.";
     auto o=summary();o["exit_code"]=code;o["ended"]=stopping?"interrupted":"session-exit";
     QString error;if(!runDirectory.isEmpty() && !saveJson(runDirectory+"/exit.json",o,&error))detail=error;
     events.close();pid=0;emit changed();emit ended();

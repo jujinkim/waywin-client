@@ -1,8 +1,8 @@
 # WayWin
 
-Windows RDP 사용자 세션의 창과 셸 기능을 Ubuntu GNOME Wayland에 통합하는 클라이언트입니다. 안정성, 호스트별 프로세스 격리, GUI에서의 복구를 우선합니다. 라이선스는 Apache-2.0입니다.
+Windows RDP 사용자 세션의 창과 셸 기능을 Linux 데스크톱에 통합하는 클라이언트입니다. GNOME·KDE 등의 Wayland와 X11을 대상으로 하며, WSLg에서도 실행을 시도할 수 있습니다. 안정성, 호스트별 프로세스 격리, GUI에서의 복구를 우선합니다. 라이선스는 Apache-2.0입니다.
 
-**현재 상태: 제품 기능과 GUI를 구현한 0.3 개발 빌드. 실제 Ubuntu/Windows 인수 검증은 미실행입니다.**
+**현재 상태: 제품 기능과 GUI를 구현한 0.3 개발 빌드. 실제 Linux/Windows 및 WSLg 인수 검증은 미실행입니다.**
 
 호스트 관리·키링 인증·접속·창/트레이 이미지와 조작·창 보존 재연결·모드 전환·Windows DVC 보조 앱·원본 셸 화면·호스트별 클립보드·환경 검증 GUI를 제공합니다. 설치 이후 Python을 실행할 필요가 없습니다. Ubuntu GUI 설치 경로와 Windows x64 보조 앱을 함께 준비합니다. macOS 컴파일과 모의 테스트를 Wayland/RDP 호환성 합격으로 간주하지 않습니다.
 

@@ -43,13 +43,13 @@ Validation::Validation(QWidget *parent):QWidget(parent),data(newReport()) {
     for(const auto &pair:QList<QPair<QString,QString>>{{"remote_ui_visible","원본 UI 별도 표시"},{"interactive","입력·조작 성공"},{"same_session","같은 사용자 세션"}}) {
         auto check=new QCheckBox(pair.second);shell[pair.first]=check;form->addRow(check);connect(check,&QCheckBox::toggled,this,[this]{update();});
     }
-    for(const auto &pair:QList<QPair<QString,QString>>{{"host_physical_layout","Windows 물리 화면"},{"client_layout","Ubuntu 화면"},{"rdp_session_layout","RDP 세션 화면"}}) {
+    for(const auto &pair:QList<QPair<QString,QString>>{{"host_physical_layout","Windows 물리 화면"},{"client_layout","Linux 화면"},{"rdp_session_layout","RDP 세션 화면"}}) {
         auto line=new QLineEdit;line->setPlaceholderText("개수·원점·크기·배율·회전·주 화면");layouts[pair.first]=line;form->addRow(pair.second,line);connect(line,&QLineEdit::textChanged,this,[this]{update();});
     }
     tabs->addTab(cases,"검증 항목");
     auto context=new QWidget;auto ctx=new QFormLayout(context);
     tester=new QLineEdit;date=new QLineEdit;ctx->addRow("검증자",tester);ctx->addRow("날짜 (YYYY-MM-DD)",date);
-    const QMap<QString,QString> labels{{"ubuntu","Ubuntu 버전"},{"gnome","GNOME 버전"},{"sdl_driver","실제 SDL 드라이버"},{"windows_edition_build","Windows 에디션·빌드"},{"rdp_policy","RDP·RemoteApp 정책"},{"freerdp_commit","FreeRDP 커밋"},{"patch_sha256","관측 패치 SHA256"}};
+    const QMap<QString,QString> labels{{"distribution","Linux 배포판·버전"},{"desktop","데스크톱·컴포지터·버전"},{"session_type","로그인 세션 (Wayland / X11 / WSLg 등)"},{"execution_environment","실행 환경 (실기기 / VM / WSLg)"},{"sdl_driver","실제 SDL 드라이버"},{"windows_edition_build","Windows 에디션·빌드"},{"rdp_policy","RDP·RemoteApp 정책"},{"freerdp_commit","FreeRDP 커밋"},{"patch_sha256","관측 패치 SHA256"}};
     for(const auto &k:data["environment"].toObject().keys()) {auto line=new QLineEdit;environmentFields[k]=line;ctx->addRow(labels.value(k,k),line);connect(line,&QLineEdit::textChanged,this,[this]{update();});}
     apps=new QPlainTextEdit;apps->setPlaceholderText("한 줄에 앱 이름 | 버전. 최소 5개.");ctx->addRow("대표 앱",apps);
     auto scroll=new QScrollArea;scroll->setWidgetResizable(true);scroll->setWidget(context);tabs->addTab(scroll,"환경·앱 기록");
@@ -60,7 +60,7 @@ Validation::Validation(QWidget *parent):QWidget(parent),data(newReport()) {
     connect(exportButton,&QPushButton::clicked,this,&Validation::exportReport);
     connect(importButton,&QPushButton::clicked,this,[this]{
         auto file=QFileDialog::getOpenFileName(this,"보고서 가져오기",{},"JSON (*.json)");if(file.isEmpty())return;
-        QString error;auto r=readJson(file,&error);if(!error.isEmpty()||r["schema"].toInt()!=2){emit failure("schema 2 보고서를 선택하세요.");return;}
+        QString error;auto r=migrateReport(readJson(file,&error));if(!error.isEmpty()||r.isEmpty()){emit failure("schema 2 또는 3 보고서를 선택하세요.");return;}
         if(QMessageBox::question(this,"현재 보고서 교체","선택 호스트의 검증 기록을 가져온 보고서로 교체할까요?")!=QMessageBox::Yes)return;
         data=r;data["independently_verified"]=false;load();flush();
     });
@@ -75,7 +75,7 @@ void Validation::setHost(const QString &p) {
     if(p==path)return;
     if(!flush())return;
     path=p;data=newReport();
-    if(QFileInfo::exists(path)) {QString error;auto r=readJson(path,&error);if(error.isEmpty()&&r["schema"].toInt()==2)data=r;else {emit failure("기존 검증 기록을 읽지 못했습니다. 원본 파일을 보존하고 내보내기로 별도 저장하세요.");path.clear();}}
+    if(QFileInfo::exists(path)) {QString error;auto r=migrateReport(readJson(path,&error));if(error.isEmpty()&&!r.isEmpty())data=r;else {emit failure("기존 검증 기록을 읽지 못했습니다. 원본 파일을 보존하고 내보내기로 별도 저장하세요.");path.clear();}}
     load();
 }
 void Validation::load() {
@@ -120,7 +120,8 @@ void Validation::attachRun(const QJsonObject &run) {
     const auto id=run["run_id"].toString();if(id.isEmpty())return;
     auto refs=evidence->text().split(';',Qt::SkipEmptyParts);const auto ref="runs/"+id;
     if(!refs.contains(ref))refs<<ref;evidence->setText(refs.join(';'));
-    if(run["sdl_driver_observed"].toString()=="wayland")environmentFields["sdl_driver"]->setText("wayland");
+    const auto driver=run["sdl_driver_observed"].toString();
+    environmentFields["sdl_driver"]->setText(QStringList{"wayland","x11"}.contains(driver)?driver:QString());
     update();
 }
 void Validation::exportReport() {

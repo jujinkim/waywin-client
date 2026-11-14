@@ -61,7 +61,7 @@ QString endpoint(const QString &input, QString *error) {
 }
 QJsonObject Host::json() const {
     return {{"id",id},{"name",name},{"server",server},{"user",user},{"domain",domain},{"app",app},
-        {"mode",mode},{"monitors",monitors},{"width",width},{"height",height},{"depth",depth},
+        {"mode",mode},{"display_backend",displayBackend},{"monitors",monitors},{"width",width},{"height",height},{"depth",depth},
         {"multimon",multimon},{"dynamic",dynamic},{"sound",sound},{"remember",remember}};
 }
 Host Host::fromJson(const QJsonObject &o) {
@@ -69,6 +69,7 @@ Host Host::fromJson(const QJsonObject &o) {
     h.id=o["id"].toString(); h.name=o["name"].toString(); h.server=o["server"].toString();
     h.user=o["user"].toString(); h.domain=o["domain"].toString(); h.app=o["app"].toString();
     h.mode=o["mode"].toString("desktop"); h.monitors=o["monitors"].toString();
+    h.displayBackend=o["display_backend"].toString("auto");
     h.width=o["width"].toInt(1280); h.height=o["height"].toInt(720); h.depth=o["depth"].toInt(32);
     h.multimon=o["multimon"].toBool(); h.dynamic=o["dynamic"].toBool();
     h.sound=o["sound"].toBool(); h.remember=o["remember"].toBool(); return h;
@@ -78,6 +79,7 @@ QString Host::validate() const {
     if (!textValid(name) || !textValid(user) || user.contains('\\') || !textValid(domain,true)) return "이름·사용자명을 입력하고 도메인은 별도 칸에 입력하세요.";
     QString error; endpoint(server,&error); if (!error.isEmpty()) return error;
     if (mode!="desktop" && mode!="rail") return "연결 모드가 올바르지 않습니다.";
+    if (!QStringList{"auto","wayland","x11"}.contains(displayBackend)) return "화면 연결 방식이 올바르지 않습니다.";
     if (!textValid(app,true) || app.contains(',')) return "앱 별칭·경로에는 쉼표와 제어 문자를 사용할 수 없습니다.";
     if (width<200 || width>8192 || height<200 || height>8192 || !QList<int>{16,24,32}.contains(depth)) return "화면 크기·색 깊이가 올바르지 않습니다.";
     if (!monitors.isEmpty()) {
@@ -108,7 +110,26 @@ QString Host::accent() const {
     const auto hash=QCryptographicHash::hash(id.toUtf8(),QCryptographicHash::Sha256);
     return QStringList{"#7651c9","#187a9d","#bb5a24","#30804b","#b34472","#6166bc"}.at(uchar(hash[0])%6);
 }
-QProcessEnvironment sessionEnvironment(const QString &certDir) {
+QStringList displayDrivers(const QProcessEnvironment &env,const QString &preference) {
+    QStringList drivers;
+    const auto display=env.value("WAYLAND_DISPLAY");
+    QString socketPath=display;
+    if (!QDir::isAbsolutePath(display)) {
+        const auto runtime=env.value("XDG_RUNTIME_DIR");
+        socketPath=QDir::isAbsolutePath(runtime)?QDir(runtime).filePath(display):QString();
+    }
+    struct stat st{};
+    if (!display.isEmpty() && !socketPath.isEmpty() &&
+        ::stat(socketPath.toLocal8Bit().constData(),&st)==0 && S_ISSOCK(st.st_mode)) drivers<<"wayland";
+    // DISPLAY is a connection hint, not proof of reachability or Xauthority access.
+    if (!env.value("DISPLAY").trimmed().isEmpty()) {
+        if (env.value("XDG_SESSION_TYPE")=="x11") drivers.prepend("x11");
+        else drivers<<"x11";
+    }
+    if (preference=="auto") return drivers;
+    return drivers.contains(preference)?QStringList{preference}:QStringList{};
+}
+QProcessEnvironment sessionEnvironment(const QString &certDir,const QString &preference) {
     auto env=QProcessEnvironment::systemEnvironment();
     for (const auto &key : env.keys()) {
         const auto upper=key.toUpper();
@@ -119,7 +140,10 @@ QProcessEnvironment sessionEnvironment(const QString &certDir) {
     const auto ime=qgetenv("SDL_IM_MODULE");
     if (ime=="ibus" || ime=="fcitx") env.insert("SDL_IM_MODULE",QString::fromLatin1(ime));
     env.insert("WAYWIN_PROBE_EVENTS","1"); env.insert("WAYWIN_PRODUCT","1");
-    env.insert("WAYWIN_CERT_DIR",certDir); env.insert("SDL_VIDEODRIVER","wayland");
+    const auto drivers=displayDrivers(env,preference);
+    env.insert("WAYWIN_CERT_DIR",certDir);
+    // Restrict SDL's automatic fallback to visible Linux window systems.
+    env.insert("SDL_VIDEO_DRIVER",drivers.isEmpty()?"waywin-unavailable":drivers.join(','));
     return env;
 }
 QString privateDirectory(const QString &path) {
@@ -144,17 +168,15 @@ QJsonObject readJson(const QString &path,QString *error) {
     if (parse.error!=QJsonParseError::NoError || !doc.isObject()) {if(error)*error="JSON 파일 형식이 올바르지 않습니다."; return {};}
     return doc.object();
 }
-QJsonObject environment() {
+QJsonObject environment(const QString &preference) {
     const auto env=QProcessEnvironment::systemEnvironment();
-    QString display=env.value("WAYLAND_DISPLAY");
-    if (!display.startsWith('/')) display=env.value("XDG_RUNTIME_DIR")+'/'+display;
-    struct stat st{};
-    const bool socket=!env.value("WAYLAND_DISPLAY").isEmpty() && ::stat(display.toLocal8Bit().constData(),&st)==0 && S_ISSOCK(st.st_mode);
-    QJsonObject checks{{"linux",QSysInfo::kernelType()=="linux"},{"ubuntu_26_04",QSysInfo::productType()=="ubuntu" && QSysInfo::productVersion()=="26.04"},
-        {"gnome",env.value("XDG_CURRENT_DESKTOP").contains("gnome",Qt::CaseInsensitive)},
-        {"wayland_session",env.value("XDG_SESSION_TYPE")=="wayland"},{"wayland_socket",socket}};
+    const auto drivers=displayDrivers(env,preference);
+    QJsonObject checks{{"linux",QSysInfo::kernelType()=="linux"},{"display_available",!drivers.isEmpty()}};
     bool ready=true; for(auto it=checks.begin();it!=checks.end();++it) ready &= it.value().toBool();
     return {{"system",QSysInfo::prettyProductName()},{"machine",QSysInfo::currentCpuArchitecture()},
+        {"desktop",env.value("XDG_CURRENT_DESKTOP","unknown")},{"session_type",env.value("XDG_SESSION_TYPE","unknown")},
+        {"wsl",env.contains("WSL_INTEROP")||env.contains("WSL_DISTRO_NAME")},
+        {"requested_driver",preference},{"driver_candidates",QJsonArray::fromStringList(drivers)},
         {"checks",checks},{"target_ready",ready},{"runtime_verified",false}};
 }
 QString verifyRuntime(const QString &manifest,QString *error,QJsonObject *metadata) {
@@ -163,6 +185,9 @@ QString verifyRuntime(const QString &manifest,QString *error,QJsonObject *metada
     if (m["schema"].toString()!="waywin-runtime-1" || m["source_commit"].toString()!=WAYWIN_FREERDP_COMMIT ||
         m["product_patch_sha256"].toString()!=WAYWIN_PRODUCT_PATCH || m["probe_patch_sha256"].toString()!=WAYWIN_PROBE_PATCH)
         return fail("이 제품 버전에 맞는 세션 엔진이 아닙니다. WayWin 런타임을 다시 빌드하거나 설치하세요.");
+    const auto backends=m["display_backends"].toArray();
+    if(m["system"].toString()=="Linux" && (!backends.contains("wayland") || !backends.contains("x11")))
+        return fail("Wayland·X11 지원 정보가 없는 이전 엔진입니다. 두 방식의 개발 패키지를 설치하고 런타임을 다시 빌드하세요.");
     const QDir root(QFileInfo(manifest).absolutePath());
     const QString base=QFileInfo(root.path()).canonicalFilePath()+'/';
     const auto files=m["files"].toObject();
@@ -220,18 +245,30 @@ QList<QJsonObject> EventDecoder::feed(const QByteArray &chunk) {
     return result;
 }
 QJsonObject newReport() {
-    auto r=readJson(":/validation/feasibility-report.example.json");
+    auto r=readJson(":/validation/product-report.example.json");
     r["date"]=QDate::currentDate().toString(Qt::ISODate);r["independently_verified"]=false;
+    return r;
+}
+QJsonObject migrateReport(QJsonObject r) {
+    if(r["schema"].toInt()==3)return r;
+    if(r["schema"].toInt()!=2)return {};
+    auto env=r["environment"].toObject();
+    env["distribution"]=env.take("ubuntu");env["desktop"]=env.take("gnome");
+    if(!env["distribution"].toString().isEmpty())env["distribution"]="Ubuntu "+env["distribution"].toString();
+    if(!env["desktop"].toString().isEmpty())env["desktop"]="GNOME "+env["desktop"].toString();
+    env["session_type"]=env["sdl_driver"];
+    env["execution_environment"]=""; // A legacy report does not establish physical/VM/WSLg provenance.
+    r["environment"]=env;r["schema"]=3;r["migrated_from_schema"]=2;r["independently_verified"]=false;
     return r;
 }
 QStringList assessReport(const QJsonObject &r) {
     QStringList errors;
-    if(r["schema"].toInt()!=2)errors<<"보고서 버전이 올바르지 않습니다.";
+    if(r["schema"].toInt()!=3)errors<<"보고서 버전이 올바르지 않습니다.";
     if(r["tester"].toString().trimmed().isEmpty())errors<<"검증자 이름을 입력하세요.";
     if(!QDate::fromString(r["date"].toString(),Qt::ISODate).isValid())errors<<"검증 날짜를 입력하세요.";
     const auto env=r["environment"].toObject();
     for(const auto &key:newReport()["environment"].toObject().keys())if(env[key].toString().trimmed().isEmpty())errors<<"환경 정보 누락: "+key;
-    if(env["sdl_driver"].toString()!="wayland")errors<<"실제 Wayland 드라이버 관측이 필요합니다.";
+    if(!QStringList{"wayland","x11"}.contains(env["sdl_driver"].toString()))errors<<"실제 Wayland 또는 X11 드라이버 관측이 필요합니다.";
     const auto apps=r["applications"].toArray();if(apps.size()<5)errors<<"대표 앱 5개 이상의 이름과 버전을 기록하세요.";
     for(const auto &v:apps){const auto a=v.toObject();if(a["name"].toString().isEmpty()||a["version"].toString().isEmpty())errors<<"앱 이름·버전이 누락되었습니다.";}
     const auto base=newReport();
@@ -253,13 +290,13 @@ QString caseInstructions(const QString &id) {
         {"P01","개별 창을 이동하고 크기를 5회 변경하세요. 한영 입력·조합키·팝업을 100/150/200%에서 확인하세요. 좌표·포커스 오류가 생기면 기록 후 종료합니다."},
         {"P02","전체 데스크톱에서 시험 앱과 대표 앱 5개를 열고 접속을 해제하세요. 앱 실행 없이 개별 창 모드로 다시 연결해 기존 창과 새 창을 확인하세요."},
         {"P03","창을 가리고 최소화·복원·최대화를 반복하세요. 임시 입력과 경과 시간이 유지되는지 확인합니다."},
-        {"P04","Windows 시험 앱의 Tray 메뉴로 아이콘 생성·변경·삭제를 3회 반복하세요. Ubuntu에서 아이콘과 좌클릭·우클릭 메뉴가 실제로 작동해야 합격입니다. 이벤트 수신만으로 합격하지 않습니다."},
+        {"P04","Windows 시험 앱의 Tray 메뉴로 아이콘 생성·변경·삭제를 3회 반복하세요. Linux에서 아이콘과 좌클릭·우클릭 메뉴가 실제로 작동해야 합격입니다. 이벤트 수신만으로 합격하지 않습니다."},
         {"P05","전체 데스크톱과 개별 창을 전환하세요. Windows Session/PID/Instance 및 임시 입력을 비교하고 앱이 추가 실행되거나 작업이 사라지면 기록하세요."},
         {"P06","네트워크를 끊었다 복원한 뒤 다시 연결하세요. 앱 재실행 없이 20회 반복하고 세션 보존·중복 실행·복구 결과를 기록하세요."},
         {"P07","두 호스트에 연결하세요. 선택 호스트 일시 정지·재개·강제 종료 중 다른 호스트와 관리 화면의 입력 반응을 확인하세요."},
         {"P08","전체 데스크톱과 선택 창을 동시에 표시할 수 있는지 조사하세요. 선택 항목입니다."},
-        {"P09","Windows shell 메뉴의 시작 메뉴·IME 설정·빠른 설정을 각각 여세요. 원본 UI가 Ubuntu에 별도 표시되어 입력·닫기·포커스 복귀가 되는지 확인하세요. 아래 셸별 결과도 채우세요."},
-        {"P10","물리 호스트 화면과 Ubuntu 화면을 구분해 M01–M06을 기록하세요. 음수 좌표·회전·혼합 DPI·hotplug·화면 복구를 포함합니다."}};
+        {"P09","Windows shell 메뉴의 시작 메뉴·IME 설정·빠른 설정을 각각 여세요. 원본 UI가 Linux에 별도 표시되어 입력·닫기·포커스 복귀가 되는지 확인하세요. 아래 셸별 결과도 채우세요."},
+        {"P10","물리 호스트 화면과 Linux 화면을 구분해 M01–M06을 기록하세요. 음수 좌표·회전·혼합 DPI·hotplug·화면 복구를 포함합니다."}};
     return text.value(id,"해당 구성에서 실제 표시·입력·동일 세션을 확인하고 관측과 증거를 기록하세요. 실패하면 반복 조작을 중지합니다.");
 }
 }

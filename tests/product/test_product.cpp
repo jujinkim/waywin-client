@@ -10,6 +10,8 @@
 #include <QDialog>
 #include <QTimer>
 #include <QTabWidget>
+#include <QComboBox>
+#include <QLocalServer>
 #include <csignal>
 #include <QtTest>
 #include <QJsonArray>
@@ -23,6 +25,13 @@
 #include <QProcess>
 #include <QSignalSpy>
 #include <unistd.h>
+class EnvironmentGuard {
+public:
+    explicit EnvironmentGuard(const QList<QByteArray> &keys) {for(const auto &key:keys)values[key]=qgetenv(key);}
+    ~EnvironmentGuard(){for(auto it=values.begin();it!=values.end();++it){if(it.value().isNull())qunsetenv(it.key());else qputenv(it.key(),it.value());}}
+private:
+    QMap<QByteArray,QByteArray> values;
+};
 class ProductTests: public QObject {
     Q_OBJECT
 private slots:
@@ -38,6 +47,9 @@ private slots:
     void hostContracts(){
         WayWin::Host h;h.id=QUuid::createUuid().toString();h.name="Work";h.server="host";h.user="alice";QVERIFY(h.validate().isEmpty());
         QCOMPARE(WayWin::Host::fromJson(h.json()).json(),h.json());
+        auto legacy=h.json();legacy.remove("display_backend");QCOMPARE(WayWin::Host::fromJson(legacy).displayBackend,QString("auto"));
+        h.displayBackend="x11";QVERIFY(h.validate().isEmpty());QCOMPARE(WayWin::Host::fromJson(h.json()).displayBackend,QString("x11"));
+        h.displayBackend="offscreen";QVERIFY(!h.validate().isEmpty());h.displayBackend="auto";
         h.monitors="1,1";h.multimon=true;QVERIFY(!h.validate().isEmpty());
         h.monitors="2,1";QVERIFY(h.validate().isEmpty());
         h.user="DOMAIN\\alice";QVERIFY(!h.validate().isEmpty());
@@ -49,10 +61,47 @@ private slots:
         QVERIFY(!a.join(' ').contains("/p:"));QVERIFY(!a.join(' ').contains("/cert:ignore"));
     }
     void environmentSanitized(){
-        qputenv("FREERDP_PASSWORD","secret");qputenv("https_proxy","secret");qputenv("WLOG_FILEAPPENDER_OUTPUT_FILE_PATH","secret");qputenv("SDL_VIDEODRIVER","x11");
-        auto env=WayWin::sessionEnvironment("/private/test");
-        QVERIFY(!env.contains("FREERDP_PASSWORD"));QVERIFY(!env.contains("https_proxy"));QVERIFY(!env.contains("WLOG_FILEAPPENDER_OUTPUT_FILE_PATH"));QCOMPARE(env.value("SDL_VIDEODRIVER"),QString("wayland"));
-        qunsetenv("FREERDP_PASSWORD");qunsetenv("https_proxy");qunsetenv("WLOG_FILEAPPENDER_OUTPUT_FILE_PATH");qunsetenv("SDL_VIDEODRIVER");
+        EnvironmentGuard guard({"FREERDP_PASSWORD","https_proxy","WLOG_FILEAPPENDER_OUTPUT_FILE_PATH","SDL_VIDEODRIVER","SDL_VIDEO_DRIVER","DISPLAY","XAUTHORITY"});
+        qputenv("FREERDP_PASSWORD","secret");qputenv("https_proxy","secret");qputenv("WLOG_FILEAPPENDER_OUTPUT_FILE_PATH","secret");qputenv("SDL_VIDEODRIVER","offscreen");qputenv("SDL_VIDEO_DRIVER","dummy");qputenv("DISPLAY",":42");qputenv("XAUTHORITY","/private/auth");
+        auto env=WayWin::sessionEnvironment("/private/test","x11");
+        QVERIFY(!env.contains("FREERDP_PASSWORD"));QVERIFY(!env.contains("https_proxy"));QVERIFY(!env.contains("WLOG_FILEAPPENDER_OUTPUT_FILE_PATH"));
+        QVERIFY(!env.contains("SDL_VIDEODRIVER"));QCOMPARE(env.value("SDL_VIDEO_DRIVER"),QString("x11"));QCOMPARE(env.value("XAUTHORITY"),QString("/private/auth"));
+        QCOMPARE(WayWin::sessionEnvironment({},"offscreen").value("SDL_VIDEO_DRIVER"),QString("waywin-unavailable"));
+    }
+    void displayDetectionAcrossDesktops(){
+        QTemporaryDir temp("/tmp/waywin-display-XXXXXX");QVERIFY(temp.isValid());
+        QLocalServer server;QVERIFY(server.listen(temp.filePath("wayland-test")));
+        QProcessEnvironment env;env.insert("XDG_RUNTIME_DIR",temp.path());env.insert("WAYLAND_DISPLAY","wayland-test");
+        for(const auto &desktop:QStringList{"GNOME","KDE","XFCE",""}) {
+            env.insert("XDG_CURRENT_DESKTOP",desktop);env.insert("XDG_SESSION_TYPE","wayland");env.insert("DISPLAY",":42");
+            QCOMPARE(WayWin::displayDrivers(env),QStringList({"wayland","x11"}));
+            QCOMPARE(WayWin::displayDrivers(env,"x11"),QStringList({"x11"}));
+            QCOMPARE(WayWin::displayDrivers(env,"wayland"),QStringList({"wayland"}));
+            env.insert("XDG_SESSION_TYPE","x11");QCOMPARE(WayWin::displayDrivers(env),QStringList({"x11","wayland"}));
+        }
+        env.remove("XDG_SESSION_TYPE");env.remove("XDG_CURRENT_DESKTOP");env.insert("WSL_DISTRO_NAME","Ubuntu");
+        QCOMPARE(WayWin::displayDrivers(env),QStringList({"wayland","x11"})); // WSLg need not declare a desktop/session type.
+        env.insert("WAYLAND_DISPLAY",temp.filePath("wayland-test"));env.remove("XDG_RUNTIME_DIR");
+        QCOMPARE(WayWin::displayDrivers(env,"wayland"),QStringList({"wayland"}));
+        server.close();QCOMPARE(WayWin::displayDrivers(env),QStringList({"x11"}));
+        QVERIFY(WayWin::displayDrivers(env,"wayland").isEmpty());
+        QFile regular(temp.filePath("ordinary"));QVERIFY(regular.open(QIODevice::WriteOnly));regular.close();
+        env.insert("WAYLAND_DISPLAY",regular.fileName());QVERIFY(WayWin::displayDrivers(env,"wayland").isEmpty());
+        env.remove("DISPLAY");QVERIFY(WayWin::displayDrivers(env).isEmpty());
+        env.insert("WAYLAND_DISPLAY","relative");QVERIFY(WayWin::displayDrivers(env).isEmpty());
+    }
+    void observedDriverMustMatchSelection(){
+        for(const auto &driver:QStringList{"wayland","x11","cocoa",""}) {
+            QTemporaryDir temp;WayWin::Host host;WayWin::Session s(host,temp.path());s.expectedDrivers={"wayland","x11"};
+            s.events.setFileName(temp.filePath("events.jsonl"));QVERIFY(s.events.open(QIODevice::WriteOnly));
+            if(!driver.isEmpty())s.pending=QJsonDocument(QJsonObject{{"type","driver"},{"driver",driver}}).toJson(QJsonDocument::Compact)+'\n';
+            s.pending+="{\"type\":\"connected\",\"code\":0}\n";s.receive();
+            const bool valid=driver=="wayland"||driver=="x11";QCOMPARE(s.failed,!valid);
+            if(valid){QCOMPARE(s.state,QString("연결됨"));QCOMPARE(s.summary()["sdl_driver_observed"].toString(),driver);}
+        }
+        QTemporaryDir temp;WayWin::Host host;WayWin::Session s(host,temp.path());s.expectedDrivers={"wayland"};
+        s.events.setFileName(temp.filePath("events.jsonl"));QVERIFY(s.events.open(QIODevice::WriteOnly));
+        s.pending="{\"type\":\"driver\",\"driver\":\"x11\"}\n";s.receive();QVERIFY(s.failed);
     }
     void privateAtomicStorage(){
         QTemporaryDir temp;QString e;auto file=temp.filePath("settings.json");
@@ -71,7 +120,7 @@ private slots:
         QVERIFY(d.feed("WAYWIN_PROBE_V1 type=title window=1 icon=0 flags=0\n").isEmpty());
     }
     void reportRequirements(){
-        auto r=WayWin::newReport();QCOMPARE(r["schema"].toInt(),2);QCOMPARE(r["cases"].toObject().size(),10);QCOMPARE(r["monitor_matrix"].toObject().size(),6);
+        auto r=WayWin::newReport();QCOMPARE(r["schema"].toInt(),3);QCOMPARE(r["cases"].toObject().size(),10);QCOMPARE(r["monitor_matrix"].toObject().size(),6);
         QVERIFY(!WayWin::assessReport(r).isEmpty());
         r["tester"]="Tester";r["date"]="2026-11-14";auto env=r["environment"].toObject();for(auto it=env.begin();it!=env.end();++it)it.value()="recorded";env["sdl_driver"]="wayland";r["environment"]=env;
         QJsonArray apps;for(int i=0;i<5;++i)apps.append(QJsonObject{{"name",QString::number(i)},{"version","1"}});r["applications"]=apps;
@@ -83,7 +132,18 @@ private slots:
             }r[group]=items;
         }
         QVERIFY(WayWin::assessReport(r).isEmpty());
+        env["sdl_driver"]="x11";env["desktop"]="KDE Plasma";r["environment"]=env;QVERIFY(WayWin::assessReport(r).isEmpty());
+        env["sdl_driver"]="offscreen";r["environment"]=env;QVERIFY(!WayWin::assessReport(r).isEmpty());
+        env["sdl_driver"]="x11";r["environment"]=env;
         auto cases=r["cases"].toObject();cases.remove("P09");r["cases"]=cases;QVERIFY(!WayWin::assessReport(r).isEmpty());
+    }
+    void legacyReportMigration(){
+        auto old=WayWin::newReport();old["schema"]=2;old["environment"]=QJsonObject{{"ubuntu","26.04"},{"gnome","50"},{"sdl_driver","wayland"}};
+        old["independently_verified"]=true;
+        auto r=WayWin::migrateReport(old);QCOMPARE(r["schema"].toInt(),3);QCOMPARE(r["cases"],old["cases"]);
+        const auto env=r["environment"].toObject();QCOMPARE(env["distribution"].toString(),QString("Ubuntu 26.04"));QCOMPARE(env["desktop"].toString(),QString("GNOME 50"));
+        QCOMPARE(env["session_type"].toString(),QString("wayland"));QVERIFY(env["execution_environment"].toString().isEmpty());QVERIFY(!r["independently_verified"].toBool());
+        QCOMPARE(WayWin::migrateReport(r),r);old["schema"]=99;QVERIFY(WayWin::migrateReport(old).isEmpty());
     }
     void hostGuiPersistence(){
         QTemporaryDir temp;
@@ -95,18 +155,22 @@ private slots:
                 dialog->findChild<QLineEdit*>("name")->setText("Validation host");
                 dialog->findChild<QLineEdit*>("server")->setText("windows.example");
                 dialog->findChild<QLineEdit*>("user")->setText("tester");
+                auto backend=dialog->findChild<QComboBox*>("displayBackend");QVERIFY(backend);backend->setCurrentIndex(backend->findData("x11"));
+                if(qEnvironmentVariableIsSet("WAYWIN_TEST_ARTIFACTS")){dialog->adjustSize();QCoreApplication::processEvents();dialog->grab().save(qEnvironmentVariable("WAYWIN_TEST_ARTIFACTS")+"/host-settings.png");}
                 dialog->findChild<QDialogButtonBox*>()->button(QDialogButtonBox::Save)->click();
             });add->click();
             QCOMPARE(window.findChild<QListWidget*>("hostList")->count(),1);
             QVERIFY(QFileInfo::exists(temp.filePath("hosts.json")));
+            QCOMPARE(WayWin::readJson(temp.filePath("hosts.json"))["hosts"].toArray()[0].toObject()["display_backend"].toString(),QString("x11"));
             auto v=window.findChild<WayWin::Validation*>();QVERIFY(v);QVERIFY(v->isEnabled());
-            v->attachRun({{"run_id","test-run"},{"sdl_driver_observed","wayland"}});
-            QCOMPARE(v->report()["environment"].toObject()["sdl_driver"].toString(),QString("wayland"));
+            v->attachRun({{"run_id","test-run"},{"sdl_driver_observed","x11"}});
+            QCOMPARE(v->report()["environment"].toObject()["sdl_driver"].toString(),QString("x11"));
         }
         WayWin::Window reopened(temp.path());
         if(qEnvironmentVariableIsSet("WAYWIN_TEST_ARTIFACTS")){reopened.show();auto tabs=reopened.findChild<QTabWidget*>();for(int i=0;i<tabs->count();++i){tabs->setCurrentIndex(i);QCoreApplication::processEvents();reopened.grab().save(qEnvironmentVariable("WAYWIN_TEST_ARTIFACTS")+QString("/tab-%1.png").arg(i));}}
         QCOMPARE(reopened.findChild<QListWidget*>("hostList")->count(),1);
-        auto v=reopened.findChild<WayWin::Validation*>();QCOMPARE(v->report()["environment"].toObject()["sdl_driver"].toString(),QString("wayland"));
+        auto v=reopened.findChild<WayWin::Validation*>();QCOMPARE(v->report()["environment"].toObject()["sdl_driver"].toString(),QString("x11"));
+        v->attachRun({{"run_id","unobserved-run"}});QVERIFY(v->report()["environment"].toObject()["sdl_driver"].toString().isEmpty());
     }
     void workerIsolationAndCleanup(){
         QProcess first,second;
@@ -135,6 +199,8 @@ private slots:
         QJsonObject m{{"schema","waywin-runtime-1"},{"source_commit","65bcca1913a28cbdd7eb913599f692bd2b707991"},{"product_patch_sha256",WAYWIN_TEST_PRODUCT_PATCH},{"probe_patch_sha256",WAYWIN_TEST_PROBE_PATCH},{"binary","bin/engine"},{"files",QJsonObject{{"bin/engine",hash}}}};
         const auto manifest=temp.filePath("waywin-runtime.json");QVERIFY(WayWin::saveJson(manifest,m));QString error;
         QCOMPARE(WayWin::verifyRuntime(manifest,&error),binary);
+        m["system"]="Linux";QVERIFY(WayWin::saveJson(manifest,m));QVERIFY(WayWin::verifyRuntime(manifest,&error).isEmpty());
+        m["display_backends"]=QJsonArray{"wayland","x11"};QVERIFY(WayWin::saveJson(manifest,m));QCOMPARE(WayWin::verifyRuntime(manifest,&error),binary);
         QVERIFY(file.open(QIODevice::WriteOnly));file.write("changed");file.close();QVERIFY(WayWin::verifyRuntime(manifest,&error).isEmpty());
         QVERIFY(file.open(QIODevice::WriteOnly));file.write("fixture");file.close();
         QFile extra(temp.filePath("libextra.so"));QVERIFY(extra.open(QIODevice::WriteOnly));extra.write("unlisted");extra.close();QVERIFY(WayWin::verifyRuntime(manifest,&error).isEmpty());extra.remove();

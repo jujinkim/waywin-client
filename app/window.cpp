@@ -109,7 +109,7 @@ Window::Window(const QString &dataRoot,QWidget *parent):QMainWindow(parent) {
     }
     auto forget=test->addAction("선택 호스트의 저장 비밀번호 삭제");connect(forget,&QAction::triggered,this,[this]{auto h=selected();if(!h)return;deleteSecret(this,h->id,[this](bool ok){if(!ok)showError("키링 삭제에 실패했습니다. 키링 잠금을 해제하고 다시 시도하세요.");else statusBar()->showMessage("저장 비밀번호를 삭제했습니다.",5000);});});
     connect(add,&QPushButton::clicked,this,[this]{editHost(true);});connect(editButton,&QPushButton::clicked,this,[this]{editHost(false);});connect(deleteButton,&QPushButton::clicked,this,&Window::removeHost);
-    connect(list,&QListWidget::currentRowChanged,this,[this]{auto h=selected();if(h){mode->setCurrentIndex(mode->findData(h->mode));launch->setChecked(false);validation->setHost(root+"/validation-"+h->id+".json");}refresh();});
+    connect(list,&QListWidget::currentRowChanged,this,[this]{auto h=selected();if(h){mode->setCurrentIndex(mode->findData(h->mode));launch->setChecked(false);validation->setHost(root+"/validation-"+h->id+".json");}checkEnvironment();refresh();});
     connect(mode,&QComboBox::currentIndexChanged,this,[this]{launch->setEnabled(mode->currentData()=="rail");});
     connect(connectButton,&QPushButton::clicked,this,[this]{connectHost();});connect(disconnectButton,&QPushButton::clicked,this,[this]{auto h=selected();if(h&&sessions.contains(h->id))sessions[h->id]->stop();});
     connect(reconnect,&QPushButton::clicked,this,[this]{connectHost(true);});connect(switchButton,&QPushButton::clicked,this,&Window::switchMode);
@@ -153,18 +153,20 @@ void Window::editHost(bool create){
     fields["server"]->setPlaceholderText("192.168.0.10:3389 또는 rdp://host:3389");fields["app"]->setPlaceholderText("||WayWinProbe");fields["monitors"]->setPlaceholderText("비우면 전체 화면, 예: 2,1");
     QSpinBox width,height;width.setRange(200,8192);height.setRange(200,8192);width.setValue(h.width);height.setValue(h.height);form->addRow("창 너비",&width);form->addRow("창 높이",&height);
     QComboBox depth;for(int n:{16,24,32})depth.addItem(QString::number(n),n);depth.setCurrentIndex(depth.findData(h.depth));form->addRow("색 깊이",&depth);
+    QComboBox backend;backend.setObjectName("displayBackend");backend.addItem("자동 감지","auto");backend.addItem("Wayland","wayland");backend.addItem("X11 / XWayland","x11");backend.setCurrentIndex(backend.findData(h.displayBackend));form->addRow("이 PC의 화면 연결",&backend);
     QCheckBox multi("전체 데스크톱도 다중 화면 사용"),dynamic("화면 변경 전달"),sound("원격 소리 재생"),remember("비밀번호를 OS 키링에 저장");multi.setChecked(h.multimon);dynamic.setChecked(h.dynamic);sound.setChecked(h.sound);remember.setChecked(h.remember);form->addRow(&multi);form->addRow(&dynamic);form->addRow(&sound);form->addRow(&remember);
     auto info=new QLabel("비밀번호는 연결 시 입력합니다. 클립보드는 Windows 앱·셸·클립보드 탭에서 선택한 호스트와만 수동 전송합니다.");info->setWordWrap(true);form->addRow(info);
     QDialogButtonBox buttons(QDialogButtonBox::Save|QDialogButtonBox::Cancel);form->addRow(&buttons);connect(&buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
     connect(&buttons,&QDialogButtonBox::accepted,&dialog,[&]{
         auto o=h.json();for(auto it=fields.begin();it!=fields.end();++it)o[it.key()]=it.value()->text().trimmed();h=Host::fromJson(o);
         h.width=width.value();h.height=height.value();h.depth=depth.currentData().toInt();h.multimon=multi.isChecked();h.dynamic=dynamic.isChecked();h.sound=sound.isChecked();h.remember=remember.isChecked();
+        h.displayBackend=backend.currentData().toString();
         // Monitor selection is also valid when the next connection uses RAIL.
         if(!h.monitors.isEmpty()&&!h.multimon)h.mode="rail";
         auto error=h.validate();if(!error.isEmpty()){QMessageBox::warning(&dialog,"설정 확인",error);return;}dialog.accept();
     });
     if(dialog.exec()!=QDialog::Accepted)return;
-    auto commit=[this,h,create]{auto before=hosts;int row=-1;for(int i=0;i<hosts.size();++i)if(hosts[i].id==h.id)row=i;if(create)hosts.append(h);else if(row>=0)hosts[row]=h;else return;if(!save()){hosts=before;return;}if(create){list->addItem(h.name);list->setCurrentRow(hosts.size()-1);}else{auto s=sessions.take(h.id);delete s;mode->setCurrentIndex(mode->findData(h.mode));}refresh();};
+    auto commit=[this,h,create]{auto before=hosts;int row=-1;for(int i=0;i<hosts.size();++i)if(hosts[i].id==h.id)row=i;if(create)hosts.append(h);else if(row>=0)hosts[row]=h;else return;if(!save()){hosts=before;return;}if(create){list->addItem(h.name);list->setCurrentRow(hosts.size()-1);}else{auto s=sessions.take(h.id);delete s;mode->setCurrentIndex(mode->findData(h.mode));}checkEnvironment();refresh();};
     if(!create&&old.remember&&(old.server!=h.server||old.user!=h.user||old.domain!=h.domain||!h.remember)) {
         busy.insert(h.id);refresh();
         deleteSecret(this,h.id,[this,commit,id=h.id](bool ok){busy.remove(id);if(ok)commit();else showError("이전 인증 정보를 키링에서 삭제하지 못했습니다. 잠금을 해제한 뒤 설정을 다시 변경하세요.");refresh();});
@@ -174,7 +176,14 @@ void Window::removeHost(){auto h=selected();if(!h)return;const auto id=h->id;if(
     auto remove=[this,id](bool ok){if(!ok){showError("키링 삭제에 실패했습니다. 잠금을 해제하고 다시 시도하세요.");return;}int row=-1;for(int i=0;i<hosts.size();++i)if(hosts[i].id==id)row=i;if(row<0)return;auto before=hosts;hosts.removeAt(row);if(!save()){hosts=before;return;}delete sessions.take(id);delete list->takeItem(row);refresh();};
     if(h->remember)deleteSecret(this,id,remove);else remove(true);
 }
-void Window::checkEnvironment(){auto e=environment();QString text="환경: "+e["system"].toString()+"\n";const auto checks=e["checks"].toObject();for(auto it=checks.begin();it!=checks.end();++it)text+=(it.value().toBool()?"✓ ":"✕ ")+it.key()+"\n";text+=e["target_ready"].toBool()?"사전 조건 충족. 실제 연결 검증을 진행하세요.":"접속에는 Ubuntu 26.04 GNOME Wayland가 필요합니다. 이 PC에서도 설정·검증 기록 화면을 사용할 수 있습니다.";environmentLabel->setText(text);}
+void Window::checkEnvironment(){
+    const auto h=selected();const auto e=environment(h?h->displayBackend:"auto");
+    QStringList drivers;for(const auto &v:e["driver_candidates"].toArray())drivers<<v.toString();
+    QString text="환경: "+e["system"].toString()+"\n데스크톱: "+e["desktop"].toString()+" · 세션: "+e["session_type"].toString()+"\n화면 연결 설정: "+e["requested_driver"].toString()+"\n시도할 연결 방식: "+(drivers.isEmpty()?"없음":drivers.join(" → "))+"\n";
+    if(e["wsl"].toBool())text+="WSL 환경 · WSLg 결과는 일반 Linux 데스크톱과 구분해 기록하세요.\n";
+    text+=e["target_ready"].toBool()?"연결을 시도할 수 있습니다. 화면 서버 접근과 실제 동작은 접속 후 확인합니다.":"접속에는 Linux와 사용 가능한 Wayland 또는 X11 화면 연결이 필요합니다. 설정·검증 기록 화면은 사용할 수 있습니다.";
+    environmentLabel->setText(text);
+}
 void Window::connectHost(bool reconnect){
     auto selectedHost=selected();if(!selectedHost||busy.contains(selectedHost->id))return;Host h=*selectedHost;h.mode=mode->currentData().toString();
     auto old=sessions.value(h.id);
@@ -187,7 +196,7 @@ void Window::connectHost(bool reconnect){
 }
 void Window::connectTarget(const Host&h,bool launchApp){
     auto error=h.validate();if(!error.isEmpty()){showError(error);return;}if(launchApp&&h.app.isEmpty()){showError("호스트 설정에 RemoteApp 별칭·경로를 입력하세요.");return;}
-    if(!environment()["target_ready"].toBool()){tabs->setCurrentIndex(2);showError("실제 접속은 Ubuntu 26.04 GNOME Wayland에서 실행하세요.");return;}
+    if(!environment(h.displayBackend)["target_ready"].toBool()){tabs->setCurrentIndex(2);checkEnvironment();showError("Linux의 Wayland 또는 X11 화면 연결을 확인하세요. 호스트 설정에서 자동 감지 또는 사용 가능한 방식을 선택하세요.");return;}
     busy.insert(h.id);refresh();
     auto watcher=new QFutureWatcher<QPair<QString,QString>>(this);
     connect(watcher,&QFutureWatcherBase::finished,this,[this,watcher,h,launchApp]{auto result=watcher->result();watcher->deleteLater();if(closing){busy.remove(h.id);return;}if(result.first.isEmpty()){busy.remove(h.id);refresh();showError(result.second);return;}authenticate(h,result.first,launchApp);});
@@ -224,11 +233,12 @@ void Window::switchMode(){
     launch->setChecked(false);connectHost(true);
 }
 void Window::listMonitors(){
-    if(!environment()["target_ready"].toBool()){showError("화면 ID 조회는 대상 Ubuntu Wayland에서 실행하세요.");return;}
+    const auto h=selected();const auto backend=h?h->displayBackend:QString("auto");
+    if(!environment(backend)["target_ready"].toBool()){showError("화면 ID 조회에는 Linux의 Wayland 또는 X11 화면 연결이 필요합니다.");return;}
     auto watcher=new QFutureWatcher<QPair<QString,QString>>(this);
-    connect(watcher,&QFutureWatcherBase::finished,this,[this,watcher]{auto r=watcher->result();watcher->deleteLater();if(r.first.isEmpty()){showError(r.second);return;}
-        auto p=new QProcess(this);p->setProcessEnvironment(sessionEnvironment({}));p->setStandardErrorFile(QProcess::nullDevice());
-        connect(p,qOverload<int,QProcess::ExitStatus>(&QProcess::finished),this,[this,p](int code,QProcess::ExitStatus){auto out=p->readAllStandardOutput().left(16384);p->deleteLater();if(code!=0)showError("화면 ID 조회 실패. Wayland 환경과 엔진 설치를 확인하세요.");else QMessageBox::information(this,"SDL 화면 ID",QString::fromUtf8(out));});
+    connect(watcher,&QFutureWatcherBase::finished,this,[this,watcher,backend]{auto r=watcher->result();watcher->deleteLater();if(r.first.isEmpty()){showError(r.second);return;}
+        auto p=new QProcess(this);p->setProcessEnvironment(sessionEnvironment({},backend));p->setStandardErrorFile(QProcess::nullDevice());
+        connect(p,qOverload<int,QProcess::ExitStatus>(&QProcess::finished),this,[this,p](int code,QProcess::ExitStatus){auto out=p->readAllStandardOutput().left(16384);p->deleteLater();if(code!=0)showError("화면 ID 조회 실패. 화면 연결 방식과 엔진 설치를 확인하세요.");else QMessageBox::information(this,"SDL 화면 ID",QString::fromUtf8(out));});
         connect(p,&QProcess::errorOccurred,this,[this,p](QProcess::ProcessError e){if(e==QProcess::FailedToStart){showError("엔진 실행 실패");p->deleteLater();}});
         auto timer=new QTimer(p);timer->setSingleShot(true);connect(timer,&QTimer::timeout,p,&QProcess::kill);timer->start(10000);p->start(r.first,{"/list:monitor"});
     });watcher->setFuture(QtConcurrent::run([manifest=runtime]{QString e;auto b=verifyRuntime(manifest,&e);return qMakePair(b,e);}));

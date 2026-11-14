@@ -44,6 +44,7 @@ signals:
     void closeRequested();
 private:
     QString root;
+    QStringList expectedDrivers;
     QString beforePause;
     QProcess worker;
     QProcess surfaceWorker;

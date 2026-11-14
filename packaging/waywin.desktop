@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=WayWin
-Comment=Windows workspaces and Wayland validation
+Comment=Windows workspaces for Linux Wayland and X11 desktops
 Exec=waywin
 Icon=waywin
 Terminal=false

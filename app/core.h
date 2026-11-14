@@ -8,6 +8,7 @@ namespace WayWin {
 struct Host {
     QString id, name, server, user, domain, app, monitors;
     QString mode = "desktop";
+    QString displayBackend = "auto";
     int width = 1280, height = 720, depth = 32;
     bool multimon = false, dynamic = false, sound = false, remember = false;
     QJsonObject json() const;
@@ -17,8 +18,9 @@ struct Host {
 };
 QString endpoint(const QString &input, QString *error = nullptr);
 QStringList arguments(const Host &host, bool launch);
-QProcessEnvironment sessionEnvironment(const QString &certificateDirectory);
-QJsonObject environment();
+QStringList displayDrivers(const QProcessEnvironment &environment, const QString &preference = "auto");
+QProcessEnvironment sessionEnvironment(const QString &certificateDirectory, const QString &preference = "auto");
+QJsonObject environment(const QString &preference = "auto");
 bool saveJson(const QString &path, const QJsonObject &object, QString *error = nullptr);
 QJsonObject readJson(const QString &path, QString *error = nullptr);
 QString privateDirectory(const QString &path);
@@ -32,6 +34,7 @@ private:
     bool dropping = false;
 };
 QJsonObject newReport();
+QJsonObject migrateReport(QJsonObject report);
 QStringList assessReport(const QJsonObject &report);
 QString caseInstructions(const QString &id);
 }

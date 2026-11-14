@@ -7,6 +7,7 @@ set(WITH_CLIENT_SDL2 OFF CACHE BOOL "" FORCE)
 set(WITH_CLIENT_SDL_VERSIONED ON CACHE BOOL "" FORCE)
 set(WITH_SERVER OFF CACHE BOOL "" FORCE)
 set(WITH_SAMPLE OFF CACHE BOOL "" FORCE)
+# Disable the separate xfreerdp client; SDL3 still builds its native X11 helpers.
 set(WITH_X11 OFF CACHE BOOL "" FORCE)
 # This disables the separate legacy Wayland client, NOT SDL3's native helpers.
 set(WITH_WAYLAND OFF CACHE BOOL "" FORCE)

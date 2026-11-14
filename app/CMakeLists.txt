@@ -16,7 +16,7 @@ target_compile_definitions(waywin-core PRIVATE
   WAYWIN_FREERDP_COMMIT="65bcca1913a28cbdd7eb913599f692bd2b707991"
   WAYWIN_PRODUCT_PATCH="${product_patch}" WAYWIN_PROBE_PATCH="${probe_patch}")
 qt_add_resources(waywin-core validation PREFIX "/validation"
-  BASE "${PROJECT_SOURCE_DIR}/docs" FILES "${PROJECT_SOURCE_DIR}/docs/feasibility-report.example.json")
+  BASE "${PROJECT_SOURCE_DIR}/docs" FILES "${PROJECT_SOURCE_DIR}/docs/product-report.example.json")
 qt_add_resources(waywin-core icons PREFIX "/icons"
   BASE "${PROJECT_SOURCE_DIR}/assets/icons" FILES "${PROJECT_SOURCE_DIR}/assets/icons/waywin-256.png")
 add_executable(waywin main.cpp window.cpp window.h validation.cpp validation.h companion.cpp companion.h)
