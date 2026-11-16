@@ -176,7 +176,13 @@ void Session::receive() {
             if(!expectedDrivers.contains(driver)){failed=true;detail="실제 화면 드라이버를 확인하지 못했습니다. 세션 엔진 설치를 확인하세요.";stop();}
             else {state="연결됨";detail="화면 연결: "+driver+" · 원격 화면에서 입력과 창 동작을 확인하세요.";}
         }
-        else if(type=="disconnected" && !stopping && !failed) {state="연결 끊김";detail="인증·인증서·서버 상태를 확인한 뒤 다시 연결하세요. 오류 코드: "+QString::number(event["code"].toDouble(),'f',0);}
+        else if(type=="disconnected" && !stopping && !failed) {
+            state="연결 끊김";
+            if(event["code"].toDouble()==0x00020001)
+                detail="서버 접속 전 초기화에 실패했습니다. 최신 설치 묶음으로 다시 설치하고 화면 연결·모니터 설정을 확인하세요. 오류 코드: 131073 (ERRCONNECT_PRE_CONNECT_FAILED)";
+            else
+                detail="인증·인증서·서버 상태를 확인한 뒤 다시 연결하세요. 오류 코드: "+QString::number(event["code"].toDouble(),'f',0);
+        }
         else if(type=="window-create")windows.insert(event["window"].toDouble());
         else if(type=="window-delete")windows.remove(event["window"].toDouble());
         else if(type=="notify-create")icons.insert((quint64(event["window"].toDouble())<<32)|quint32(event["icon"].toDouble()));

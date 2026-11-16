@@ -38,6 +38,8 @@ ExternalProject_Add(waywin-runtime
   INSTALL_COMMAND "${CMAKE_COMMAND}" --install <BINARY_DIR>
   LOG_DOWNLOAD ON LOG_CONFIGURE ON LOG_BUILD ON LOG_INSTALL ON
   LOG_OUTPUT_ON_FAILURE ON)
+ExternalProject_Add_StepDependencies(waywin-runtime configure
+  "${CMAKE_SOURCE_DIR}/cmake/FreeRDPProduct.cmake")
 ExternalProject_Add_Step(waywin-runtime refresh-manifest
   COMMAND "${CMAKE_COMMAND}" -DSTAGE=${WAYWIN_RUNTIME_STAGE} -DROOT=${CMAKE_SOURCE_DIR}
     -DBUILD=<BINARY_DIR> -P "${CMAKE_SOURCE_DIR}/cmake/RuntimeManifest.cmake"

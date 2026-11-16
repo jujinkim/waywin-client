@@ -103,6 +103,21 @@ private slots:
         s.events.setFileName(temp.filePath("events.jsonl"));QVERIFY(s.events.open(QIODevice::WriteOnly));
         s.pending="{\"type\":\"driver\",\"driver\":\"x11\"}\n";s.receive();QVERIFY(s.failed);
     }
+    void preconnectFailureExplained(){
+        for(const auto code:{131073,131081}) {
+            QTemporaryDir temp;WayWin::Host host;WayWin::Session s(host,temp.path());
+            s.events.setFileName(temp.filePath("events.jsonl"));QVERIFY(s.events.open(QIODevice::WriteOnly));
+            s.pending=QJsonDocument(QJsonObject{{"type","disconnected"},{"code",code}}).toJson(QJsonDocument::Compact)+'\n';s.receive();
+            QVERIFY(s.detail.contains(QString::number(code)));
+            if(code==131073) {
+                QVERIFY(s.detail.contains("서버 접속 전 초기화"));
+                QVERIFY(s.detail.contains("ERRCONNECT_PRE_CONNECT_FAILED"));
+            } else QVERIFY(s.detail.contains("인증"));
+            const auto message=s.detail;
+            s.finish(136,QProcess::NormalExit);
+            QCOMPARE(s.state,QString("연결 실패"));QCOMPARE(s.detail,message);
+        }
+    }
     void privateAtomicStorage(){
         QTemporaryDir temp;QString e;auto file=temp.filePath("settings.json");
         QVERIFY(WayWin::saveJson(file,{{"value",7}},&e));QCOMPARE(WayWin::readJson(file)["value"].toInt(),7);
