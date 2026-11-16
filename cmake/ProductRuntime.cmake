@@ -1,11 +1,31 @@
 include(ExternalProject)
 find_package(Git REQUIRED)
 set(WAYWIN_RUNTIME_REPOSITORY "https://github.com/FreeRDP/FreeRDP.git" CACHE STRING "Mirror of the pinned FreeRDP repository")
+set(WAYWIN_RUNTIME_ARCHIVE "" CACHE FILEPATH "Bundled, pinned FreeRDP source archive; no Git download when set")
+if(WAYWIN_RUNTIME_ARCHIVE)
+  if(NOT EXISTS "${WAYWIN_RUNTIME_ARCHIVE}" OR IS_DIRECTORY "${WAYWIN_RUNTIME_ARCHIVE}")
+    message(FATAL_ERROR "Bundled FreeRDP source archive is missing. Obtain a complete WayWin bundle.")
+  endif()
+  file(READ "${CMAKE_SOURCE_DIR}/dependencies.lock.json" dependency_lock)
+  string(JSON archive_hash GET "${dependency_lock}" freerdp source_archive_sha256)
+  file(SHA256 "${WAYWIN_RUNTIME_ARCHIVE}" actual_hash)
+  if(NOT actual_hash STREQUAL archive_hash)
+    message(FATAL_ERROR "Bundled FreeRDP source archive failed SHA-256 verification. Obtain a complete WayWin bundle.")
+  endif()
+  set(runtime_download URL "${WAYWIN_RUNTIME_ARCHIVE}" URL_HASH "SHA256=${archive_hash}")
+  # CMake 3.22 predates this policy; newer versions should timestamp extracted files now.
+  if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+  endif()
+else()
+  set(runtime_download
+    GIT_REPOSITORY "${WAYWIN_RUNTIME_REPOSITORY}"
+    GIT_TAG 65bcca1913a28cbdd7eb913599f692bd2b707991
+    GIT_CONFIG core.autocrlf=false)
+endif()
 set(WAYWIN_RUNTIME_STAGE "${CMAKE_BINARY_DIR}/runtime")
 ExternalProject_Add(waywin-runtime
-  GIT_REPOSITORY "${WAYWIN_RUNTIME_REPOSITORY}"
-  GIT_TAG 65bcca1913a28cbdd7eb913599f692bd2b707991
-  GIT_CONFIG core.autocrlf=false
+  ${runtime_download}
   UPDATE_COMMAND ""
   PATCH_COMMAND "${CMAKE_COMMAND}" -DSOURCE=<SOURCE_DIR> -DROOT=${CMAKE_SOURCE_DIR}
     -DGIT=${GIT_EXECUTABLE} -P "${CMAKE_SOURCE_DIR}/cmake/ApplyRuntimePatches.cmake"

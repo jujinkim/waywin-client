@@ -6,7 +6,7 @@
 
 테스트 묶음의 START-HERE.md를 따른다.
 
-- Ubuntu/Debian 계열: ubuntu/WayWin-Setup.desktop의 실행을 허용하고 연다. GUI에서 관리자 인증 후 apt 패키지 설치 → 고정 FreeRDP/WayWin 빌드 → 사용자 폴더 설치가 진행된다. 최초 설치에는 인터넷과 빌드 시간이 필요하다. 패키지 목록은 Ubuntu 26.04 기준이며, 다른 버전의 저장소에 Qt 6.4 이상·SDL3·SDL3_ttf 개발 패키지가 없으면 설치가 실패하고 진단 파일을 보여준다. GNOME·KDE 또는 X11·Wayland에 따른 설치 제한은 없다. 앱 목록에 WayWin과 WayWin 제거가 생긴다. **Linux 바이너리를 미리 빌드한 패키지가 아니라 현지 빌드 설치 묶음**이다.
+- Ubuntu/Debian 계열: ubuntu/WayWin-Setup.desktop의 실행을 허용하고 연다. GUI에서 관리자 인증 후 apt 패키지 설치 → 고정 FreeRDP/WayWin 빌드 → 사용자 폴더 설치가 진행된다. **FreeRDP 3.33.1 원본 소스가 ubuntu/dependencies/FreeRDP-3.33.1.tar에 포함되어 설치 중 GitHub 접속이나 클론을 하지 않는다.** 소스의 SHA-256을 검사한 뒤 제품 패치를 적용하며, 파일이 없거나 손상되면 다운로드로 대체하지 않고 중단한다. OS 패키지 설치에는 인터넷이 필요하고 현지 빌드 시간도 필요하다. 패키지 목록은 Ubuntu 26.04 기준이며, 다른 버전의 저장소에 Qt 6.4 이상·SDL3·SDL3_ttf 개발 패키지가 없으면 설치가 실패하고 진단 파일을 보여준다. GNOME·KDE 또는 X11·Wayland에 따른 설치 제한은 없다. 앱 목록에 WayWin과 WayWin 제거가 생긴다. **Linux 바이너리를 미리 빌드한 패키지가 아니라 소스를 포함한 현지 빌드 설치 묶음**이다.
 - Windows x64: windows/WayWin Companion.exe를 해당 사용자 세션에서 실행한다. Install + start at sign-in은 현재 사용자에게 설치하고 로그인 자동 시작을 등록한다. 닫기는 알림 영역으로 숨기며, Disable startup은 자동 시작 해제, Exit companion은 종료다.
 - windows/WayWin Windows Probe.exe는 Session/PID/Instance·임시 입력·창·팝업·트레이를 비교하는 시험 앱이다.
 - 다른 Linux 배포판은 아래 개발자 빌드 절차로 설치한다. macOS 실행본은 개발 GUI 확인용이며 제품 접속 대상은 Linux다.
@@ -74,6 +74,10 @@ ctest --test-dir build/product --output-on-failure
 cmake --install build/product --prefix "$HOME/.local/waywin"
 cpack --config build/product/CPackConfig.cmake
 ~~~
+
+설치 묶음의 소스를 사용하는 개발자 빌드는 위 첫 명령에 `-DWAYWIN_RUNTIME_ARCHIVE=/절대/경로/FreeRDP-3.33.1.tar`를 추가한다. 지정한 파일은 lockfile의 SHA-256과 일치해야 한다. 이 옵션을 주지 않은 개발자 빌드는 기존 고정 Git 저장소를 사용한다.
+
+인수 묶음은 Windows 실행 파일을 준비한 뒤 `python3 tools/package_review.py --freerdp-source /기존/FreeRDP/checkout`으로 만든다. 기본 checkout은 `.cache/FreeRDP-3.33.1`이며, 작업 폴더의 수정본 대신 고정 커밋을 `git archive`로 내보내 lockfile과 비교한다. 제작 도구도 소스를 새로 내려받지 않는다. 원본의 LICENSE와 다른 라이선스·저작권 파일은 소스 아카이브에 유지된다.
 
 Windows Visual Studio C++ 환경:
 

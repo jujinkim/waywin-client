@@ -18,8 +18,15 @@ if [[ $# -gt 0 ]] && [[ "$1" == --remove ]]; then
     rm -f -- "$HOME/.local/share/applications/waywin.desktop" "$HOME/.local/share/applications/waywin-remove.desktop"
     zenity --info --text="WayWin 실행 파일을 제거했습니다."; exit 0
 fi
-zenity --question --width=520 --title="WayWin 설치" --text="필요한 Linux 패키지를 설치하고 WayWin을 빌드합니다.\nGNOME·KDE 등의 Wayland/X11 화면에서 사용할 수 있습니다.\n저장소에 Qt 6.4 이상·SDL3·SDL3_ttf 개발 패키지가 필요합니다.\n인터넷 연결과 관리자 인증이 필요하며 빌드는 시간이 걸릴 수 있습니다.\n앱은 사용자 폴더에 설치합니다." || exit 0
+runtime_archive="$bundle/dependencies/FreeRDP-3.33.1.tar"
+if [[ ! -f "$runtime_archive" ]]; then
+    zenity --error --width=520 --text="설치 묶음에 FreeRDP 소스가 없습니다.\n전체 설치 묶음을 다시 받아 압축을 풀어 주세요.\n필요한 파일: $runtime_archive"
+    exit 1
+fi
+zenity --question --width=520 --title="WayWin 설치" --text="필요한 Linux 패키지를 설치하고 WayWin을 빌드합니다.\nFreeRDP 소스는 설치 묶음에 포함되어 GitHub에서 내려받지 않습니다.\nGNOME·KDE 등의 Wayland/X11 화면에서 사용할 수 있습니다.\nOS 패키지 설치에는 인터넷 연결과 관리자 인증이 필요합니다.\n앱은 사용자 폴더에 설치하며 빌드는 시간이 걸릴 수 있습니다." || exit 0
 build_id="$(sha256sum "$source_root/patches/freerdp-3.33.1-product.patch" \
+    "$source_root/patches/freerdp-3.33.1-probe.patch" "$source_root/dependencies.lock.json" \
+    "$source_root/cmake/ProductRuntime.cmake" "$source_root/cmake/ApplyRuntimePatches.cmake" \
     "$source_root/cmake/FreeRDPProduct.cmake" "$source_root/cmake/RuntimeManifest.cmake" | sha256sum | cut -c1-16)"
 build_dir="$HOME/.cache/waywin/build-$build_id"
 mkdir -p "$build_dir"
@@ -35,7 +42,8 @@ rm -f "$success"
         libwayland-dev wayland-protocols libxkbcommon-dev libx11-dev libxext-dev \
         libxrandr-dev libxi-dev libxcursor-dev libxfixes-dev libxcb-cursor0 liburiparser-dev libicu-dev
     cmake -S "$source_root" -B "$build_dir" -G Ninja \
-        -DWAYWIN_BUILD_RUNTIME=ON -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
+        -DWAYWIN_BUILD_RUNTIME=ON -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+        -DWAYWIN_RUNTIME_ARCHIVE="$runtime_archive"
     cmake --build "$build_dir" --parallel 4
     cmake --install "$build_dir" --prefix "$prefix"
     mkdir -p "$HOME/.local/share/applications" "$prefix/setup"

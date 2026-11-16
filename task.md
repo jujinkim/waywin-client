@@ -1,5 +1,18 @@
 # 작업 기록
 
+## FreeRDP 소스를 포함한 Linux 설치 묶음 (2026-11-16)
+
+사용자 보고: Linux GUI 설치 중 FreeRDP 클론이 HTTP 403으로 실패했고 회사 보안 정책에서 저장소가 차단된 것으로 확인했다. 사용자 선택에 따라 FreeRDP 원본 소스를 설치 묶음에 포함하여 설치 시 GitHub 접속을 제거했다. 소스 포함은 Linux 사전 빌드나 OS 패키지의 오프라인 설치를 의미하지 않는다.
+
+- `tools/package_review.py`가 기존 checkout의 고정 커밋을 `git archive`로 내보내 `ubuntu/dependencies/FreeRDP-3.33.1.tar`에 포함한다. 로컬 수정·미추적 파일·Git 이력은 포함하지 않고 원본 LICENSE·저작권 파일은 유지한다. 제작 중에도 새 다운로드를 하지 않는다.
+- 원본 아카이브의 SHA-256을 `dependencies.lock.json`에 고정했다. `WAYWIN_RUNTIME_ARCHIVE`로 지정한 파일을 CMake 구성과 압축 해제 직전에 확인한다. GUI 설치기는 포함된 파일을 반드시 사용하며 누락·손상을 Git 다운로드로 대체하지 않는다. 개발자 CMake 빌드에서 아카이브를 지정하지 않은 경우만 기존 Git 경로를 유지한다.
+- Git 저장소 안에 압축을 푼 경우 Git-format 관측 패치가 상위 저장소의 경로로 해석되어 건너뛰는 문제를 실제 원본 빌드에서 발견했다. 패치 실행 시 상위 저장소 탐색을 막고 인덱스를 사용하지 않도록 수정했다. Git 메타데이터 없는 원본의 버전은 릴리스 기본값을 사용하며 선택적 FetchContent 다운로드도 끈다.
+- 설치 캐시 키에 원본 lockfile·두 패치·런타임 구성/패치 스크립트를 포함해 이전 클론 캐시와 분리한다. 설치·개발자 제작 안내를 갱신했다.
+
+검증: 소스 출처·손상/누락 거부·구성 후 변조 거부·상위 Git 저장소/공백 경로에서의 압축 해제와 실제 Git-format 패치 적용·중복 패치 방지 계약 6개를 추가했다. Git 네트워크 명령을 차단한 모의 환경에서 통과했다. CTest 2개 묶음(Python 3.12 **78개**, 기존 Qt 제품 계약) 모두 통과. `build/product-bundled-runtime`에서 실제 원본 아카이브로 macOS FreeRDP 전체 빌드·설치 성공, `/version` 3.33.1과 런타임 35개 파일 해시를 확인했다. 설치 스크립트 구문과 `git diff --check`도 통과했다.
+
+산출물은 `out/release/waywin-0.3.0-linux-desktops.tar.gz`와 `.sha256`이다. 전체 묶음을 풀고 기존 `ubuntu/WayWin-Setup.desktop`을 실행한다. OS 개발 패키지는 여전히 apt 저장소에서 설치한다. 실제 Ubuntu 재설치·RDP 호환성은 이 macOS 검증으로 확인하지 않았으며 Windows 바이너리는 기존과 같다. 원격 푸시는 하지 않는다.
+
 ## Ubuntu 설치 중 GCC 경고 오류 수정 (2026-11-15)
 
 사용자 실환경 보고: Ubuntu 설치가 `[20/28]`에서 중단됐고, 122행 38열에 `misleadingly indented ... guarded by the 'if'` 진단이 표시됐다. Windows는 아직 시도하지 못했다. Ubuntu 전체 로그·배포판·컴파일러 버전은 확보하지 못했다.

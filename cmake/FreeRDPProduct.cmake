@@ -1,5 +1,12 @@
 # Product runtime profile. Software graphics and explicit companion clipboard; no file/device sharing.
 set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+# Bundled sources have no Git metadata. Keep their release version and prohibit
+# optional FetchContent dependencies from downloading during the product build.
+set(USE_VERSION_FROM_GIT_TAG OFF CACHE BOOL "" FORCE)
+set(USE_GIT_FOR_REVISION OFF CACHE BOOL "" FORCE)
+set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL "" FORCE)
+set(WITH_CWALK OFF CACHE BOOL "" FORCE)
+set(WITH_WEBVIEW_AAD_AUTH_HELPER OFF CACHE BOOL "" FORCE)
 set(WITH_CLIENT ON CACHE BOOL "" FORCE)
 set(WITH_CLIENT_SDL ON CACHE BOOL "" FORCE)
 set(WITH_CLIENT_SDL3 ON CACHE BOOL "" FORCE)
