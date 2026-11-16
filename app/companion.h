@@ -19,6 +19,7 @@ private:
     QListWidget *apps;
     QPlainTextEdit *clipboard;
     QWidget *actions;
+    QWidget *shellActions;
     QMap<Session*,QMap<quint32,QPointer<QWidget>>> surfaces;
     QMap<QString,QString> clipboardDrafts;
     void message(Session*,const QByteArray&);

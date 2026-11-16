@@ -7,6 +7,7 @@
 #include <QSet>
 #include <QMap>
 #include "../protocol/waywin_wire.hpp"
+#include "transport.h"
 class ProductTests;
 namespace WayWin {
 class Session : public QObject {
@@ -26,6 +27,7 @@ public:
     QString companionIdentity,companionStatus="Windows 보조 앱을 기다리고 있습니다.";
     quint32 epoch=1;
     bool companionReady=false;
+    bool shellReady=false, inputBlocked=false;
     bool surfaceProxy=false;
     bool active() const;
     void start(const QString &binary, QByteArray password, bool launch);
@@ -34,6 +36,9 @@ public:
     void command(unsigned action, quint32 window, quint32 icon = 0);
     quint32 request(quint32 type,const std::vector<uint8_t>& data={});
     void recovery(unsigned action);
+    void discardInput(){if(proxyWriter)proxyWriter->discardPending();}
+    void proxyFlow(bool value){upstreamBlocked=value;inputBlocked=upstreamBlocked||proxyBlocked;}
+    QByteArray trayImage(quint64 id){if(trayImages.contains(id))imageUse[id]=++imageClock;return trayImages.value(id);}
     QJsonObject summary() const;
 signals:
     void changed();
@@ -48,6 +53,8 @@ private:
     QString beforePause;
     QProcess worker;
     QProcess surfaceWorker;
+    CommandWriter commandWriter{&worker};
+    CommandWriter *proxyWriter=nullptr;
     WayWinWire::Decoder surfaceCommands;
     QByteArray pending;
     QFile events;
@@ -58,9 +65,23 @@ private:
     quint32 nextRequest=10;
     QMap<quint32,qint64> requests;
     QSet<quint32> inputRequests;
+    QSet<quint32> controlRequests;
+    QMap<quint32,qint64> inputDeadlines;
+    QMap<quint64,quint64> imageUse;
+    quint64 imageClock=0;
+    qsizetype imageBytes=0;
+    QSet<unsigned> blockedStages;
+    QSet<unsigned> busyStages;
+    bool upstreamBlocked=false,proxyBlocked=false;
+    WayWinPolicy::Stall inputStall;
+    QElapsedTimer monotonic;
     unsigned crashRestarts=0;
     bool channelReady=false;
     qint64 lastHeartbeat=0;
+    void clearTransient(bool preserveWindows);
+    void removeIcon(quint64 id);
+    void resourceFailure();
+    void updateFlow(unsigned stage,bool blocked);
     void receiveTransient(const QByteArray &bytes);
     void forwardSurface(const QByteArray &bytes);
     void receive();

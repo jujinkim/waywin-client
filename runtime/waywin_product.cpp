@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "waywin_product.hpp"
 #include "sdl_context.hpp"
+#include "waywin_policy.hpp"
 #include <freerdp/dvc.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/error.h>
@@ -26,7 +27,10 @@ static std::atomic<Uint64> recoveryStart{0};
 static std::atomic<bool> readerStarted{false},retryPaused{false};
 static std::mutex commandsLock,channelLock,outputLock;
 struct Command {unsigned action,window,icon,epoch;std::string payload;};
-static std::deque<Command> commands;
+static WayWinPolicy::Queue commands;
+static WayWinPolicy::Stall commandStall;
+static bool commandsLow=true;
+static std::atomic<bool> queueFatal{false};
 static IWTSVirtualChannel* activeChannel=nullptr;
 struct Picture {SDL_Window*window;SDL_Texture*texture;};
 static std::map<SDL_Renderer*,Picture> pictures;
@@ -42,7 +46,7 @@ struct Callback {IWTSVirtualChannelCallback iface{};IWTSVirtualChannel*channel=n
 static UINT received(IWTSVirtualChannelCallback* base,wStream* stream) {
     auto*c=reinterpret_cast<Callback*>(base);
     try {for(auto m:c->decoder.feed(static_cast<const uint8_t*>(Stream_ConstPointer(stream)),Stream_GetRemainingLength(stream))) {
-        if(m.type<Ready||m.type>SurfaceGone||m.epoch!=c->epoch)continue;
+        if(m.type<Ready||m.type>InputAck||m.epoch!=c->epoch)continue;
         waywinEmit(std::move(m));
     }}catch(...){return ERROR_INVALID_DATA;}
     return CHANNEL_RC_OK;
@@ -51,7 +55,7 @@ static UINT opened(IWTSVirtualChannelCallback*base) {
     auto*c=reinterpret_cast<Callback*>(base);
     {std::lock_guard<std::mutex>lock(channelLock);activeChannel=c->channel;c->epoch=++waywinEpoch;}
     Message state{Channel,0,c->epoch,{}};put(state.data,1);waywinEmit(std::move(state));
-    auto hello=encode({Hello,1,c->epoch,{}});
+    Message request{Hello,1,c->epoch,{}};put(request.data,RequestedCapabilities);auto hello=encode(request);
     return c->channel->Write(c->channel,static_cast<ULONG>(hello.size()),hello.data(),nullptr);
 }
 static UINT closed(IWTSVirtualChannelCallback*base) {
@@ -82,21 +86,40 @@ static PVIRTUALCHANNELENTRY provider(LPCSTR name,LPCSTR subsystem,LPCSTR type,DW
     return freerdp_channels_load_static_addin_entry(name,subsystem,type,flags);
 }
 void waywinRegister(){if(std::getenv("WAYWIN_PRODUCT"))std::ignore=freerdp_register_addin_provider(provider,0);}
+static void queueFlow(unsigned state) {
+    Message m{Flow,0,waywinEpoch.load(),{}};put(m.data,2);put(m.data,state);waywinEmit(std::move(m));
+}
 void waywinStartCommands() {
     if(!std::getenv("WAYWIN_PRODUCT")||readerStarted.exchange(true))return;
     std::thread([]{
-        std::string line;bool drop=false;char c=0;
+        std::string line;char c=0;
         while(::read(STDIN_FILENO,&c,1)==1) {
             if(c=='\n') {
-                if(!drop) {
-                    std::istringstream input(line);Command cmd{};std::string extra;
-                    if((input>>cmd.action>>cmd.window>>cmd.icon>>cmd.epoch>>cmd.payload)&&!(input>>extra)) {
-                        if(cmd.action==21||cmd.action==22||cmd.action==23)retryAction=cmd.action;
-                        else {std::lock_guard<std::mutex>lock(commandsLock);if(commands.size()<128)commands.push_back(std::move(cmd));}
+                try {
+                    auto packet=WayWinPolicy::commandPacket(line);
+                    std::istringstream input(line);Command cmd{};input>>cmd.action>>cmd.window>>cmd.icon>>cmd.epoch>>cmd.payload;
+                    if(cmd.epoch==waywinEpoch) {
+                        if(cmd.action==23){unsigned idle=0;retryAction.compare_exchange_strong(idle,23);}
+                        else if(cmd.action==21||cmd.action==22)retryAction=cmd.action;
+                        else {
+                            WayWinPolicy::Admission admitted;uint32_t replaced=0;bool notify=false,loadChanged=false;
+                            {std::lock_guard<std::mutex>lock(commandsLock);
+                                admitted=commands.push(std::move(packet));replaced=commands.replacedRequest;loadChanged=commandsLow&&!commands.low();commandsLow=commands.low();
+                                if(admitted!=WayWinPolicy::Admission::Accepted||commands.high()){notify=!commandStall.active();commandStall.set(true,SDL_GetTicks());}
+                                // Serialize watermark notifications with queue changes so a
+                                // late blocked event cannot overtake a subsequent resume.
+                                if(admitted==WayWinPolicy::Admission::ControlFull){queueFatal=true;queueFlow(2);}
+                                else if(notify)queueFlow(1);
+                                else if(loadChanged)queueFlow(3);
+                            }
+                            if(replaced)waywinEmit({InputAck,replaced,cmd.epoch,{}});
+                        }
                     }
-                }
-                line.clear();drop=false;
-            }else if(line.size()<2*(Maximum+24)+128)line+=c;else drop=true;
+                }catch(...){queueFatal=true;queueFlow(2);}
+                line.clear();
+            }else if(line.size()<WayWinPolicy::CommandLineBytes)line+=c;else {queueFatal=true;queueFlow(2);break;}
+            bool expired=false;{std::lock_guard<std::mutex>lock(commandsLock);expired=commandStall.expired(SDL_GetTicks());}
+            if(expired){queueFatal=true;queueFlow(2);break;}
         }
     }).detach();
 }
@@ -153,13 +176,21 @@ bool waywinInput(const SDL_Event&ev) {
 }
 void waywinTick(SdlContext*sdl) {
     if(!std::getenv("WAYWIN_PRODUCT"))return;
-    std::deque<Command>pending;{std::lock_guard<std::mutex>lock(commandsLock);pending.swap(commands);}
-    for(const auto&c:pending) {
+    if(queueFatal)return;
+    for(;;) {
+        std::string line;bool resumed=false;uint32_t completion=0;
+        {std::lock_guard<std::mutex>lock(commandsLock);
+            if(commands.empty())break;
+            completion=commands.front().request;line=std::move(commands.front().bytes);commands.pop();
+            if(commands.low()&&(commandStall.active()||!commandsLow)){commandStall.set(false,SDL_GetTicks());resumed=true;}commandsLow=commands.low();
+            if(resumed)queueFlow(0);
+        }
+        Command c{};std::istringstream input(line);input>>c.action>>c.window>>c.icon>>c.epoch>>c.payload;
         if(c.epoch!=waywinEpoch||waywinRecovering)continue;
-        if(c.action>=1&&c.action<=6)sdl->getRailChannelContext().productCommand(c.action,c.window,c.icon);
+        if(c.action>=1&&c.action<=6){sdl->getRailChannelContext().productCommand(c.action,c.window,c.icon);if(completion)waywinEmit({InputAck,completion,c.epoch,{}});}
         else if(c.action==20)try {
             auto bytes=unhex(c.payload);Decoder decoder;auto messages=decoder.feed(bytes.data(),bytes.size());
-            if(messages.size()!=1||encode(messages[0])!=bytes||!requestType(messages[0].type)||messages[0].epoch!=waywinEpoch)continue;
+            if(messages.size()!=1||messages[0].epoch!=waywinEpoch)continue;
             std::lock_guard<std::mutex>lock(channelLock);
             if(activeChannel)std::ignore=activeChannel->Write(activeChannel,static_cast<ULONG>(bytes.size()),bytes.data(),nullptr);
         }catch(...){}
@@ -175,6 +206,10 @@ static bool networkFailure(freerdp*instance) {
         error==FREERDP_ERROR_DNS_ERROR;
 }
 static void retryStatus(unsigned state,unsigned attempt,unsigned seconds,unsigned error) {
+    static std::mutex statusLock;static unsigned previous[4]={~0u,~0u,~0u,~0u};
+    std::lock_guard<std::mutex>guard(statusLock);
+    if(previous[0]==state&&previous[1]==attempt&&previous[2]==seconds&&previous[3]==error)return;
+    previous[0]=state;previous[1]=attempt;previous[2]=seconds;previous[3]=error;
     Message m{Retry,0,waywinEpoch.load(),{}};put(m.data,state);put(m.data,attempt);put(m.data,seconds);put(m.data,error);waywinEmit(std::move(m));
 }
 bool waywinReconnect(freerdp*instance) {
@@ -184,35 +219,28 @@ bool waywinReconnect(freerdp*instance) {
     // Never replay RemoteApplicationProgram after the initial connection.
     std::ignore=freerdp_settings_set_string(instance->context->settings,FreeRDP_RemoteApplicationProgram,"");
     std::mt19937 random(std::random_device{}());
-    unsigned attempt=0;
+    WayWinPolicy::RetryBudget budget;
+    auto delay=[&](unsigned attempt){return (1u<<attempt)*static_cast<unsigned>(std::uniform_int_distribution<int>(800,1200)(random));};
+    budget.disconnected(SDL_GetTicks(),delay(0));
     for(;;) {
-        if(retryAction==22||attempt>=5) {
-            retryPaused=true;retryAttempt=5;retrySeconds=0;retryStatus(2,attempt,0,freerdp_get_last_error(instance->context));
-            while(retryAction!=21&&retryAction!=23) {
-                if(freerdp_get_last_error(instance->context)==FREERDP_ERROR_CONNECT_CANCELLED){waywinRecovering=false;return false;}
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            attempt=0;retryPaused=false;
-        }
-        bool immediate=retryAction==21||retryAction==23;retryAction=0;
-        retryAttempt=++attempt;
-        auto milliseconds=immediate?0:static_cast<unsigned>((1u<<(attempt-1))*std::uniform_int_distribution<int>(800,1200)(random));
-        auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(milliseconds);
-        while(std::chrono::steady_clock::now()<deadline) {
-            if(retryAction)break;
-            retrySeconds=static_cast<unsigned>(std::chrono::duration_cast<std::chrono::seconds>(deadline-std::chrono::steady_clock::now()).count()+1);
-            retryStatus(1,attempt,retrySeconds,0);std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        }
-        if(retryAction==22)continue;
-        if(retryAction==21||retryAction==23){attempt=0;continue;}
+        const auto action=retryAction.exchange(0);const auto now=SDL_GetTicks();
+        if(action==22)budget.stop();
+        else if(action==21)budget.manual(now);
+        else if(action==23)budget.wake(now);
+        retryPaused=budget.state!=WayWinPolicy::RetryState::Automatic;
+        retryAttempt=budget.attempts;
         if(freerdp_get_last_error(instance->context)==FREERDP_ERROR_CONNECT_CANCELLED){waywinRecovering=false;return false;}
-        retrySeconds=0;retryStatus(1,attempt,0,0);
+        if(retryPaused){retrySeconds=0;retryStatus(budget.state==WayWinPolicy::RetryState::Stopped?2:5,budget.attempts,0,freerdp_get_last_error(instance->context));std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
+        if(now<budget.due){retrySeconds=static_cast<unsigned>((budget.due-now+999)/1000);retryStatus(1,budget.attempts,retrySeconds,0);std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
+        if(!budget.begin(now))continue;
+        retryAttempt=budget.attempts;retrySeconds=0;retryStatus(1,budget.attempts,0,0);
         std::mutex lock;std::condition_variable done;bool finished=false;std::atomic<bool> timedOut{false};
         std::thread watchdog([&]{std::unique_lock<std::mutex>guard(lock);if(!done.wait_for(guard,std::chrono::seconds(9),[&]{return finished;})){timedOut=true;std::ignore=freerdp_abort_connect_context(instance->context);}});
         const bool connected=freerdp_reconnect(instance);
         {std::lock_guard<std::mutex>guard(lock);finished=true;}done.notify_one();watchdog.join();
-        if(connected){{std::lock_guard<std::mutex>guard(commandsLock);commands.clear();}waywinRecovering=false;retryStatus(0,attempt,0,0);return true;}
+        if(connected){{std::lock_guard<std::mutex>guard(commandsLock);commands.clear();commandsLow=true;commandStall.set(false,SDL_GetTicks());}budget.succeeded();waywinRecovering=false;retryStatus(0,retryAttempt,0,0);return true;}
         if(timedOut)freerdp_set_last_error(instance->context,FREERDP_ERROR_CONNECT_TRANSPORT_FAILED);
-        if(!networkFailure(instance)){retryStatus(3,attempt,0,freerdp_get_last_error(instance->context));waywinRecovering=false;return false;}
+        if(!networkFailure(instance)){budget.forbid();retryStatus(3,budget.attempts,0,freerdp_get_last_error(instance->context));waywinRecovering=false;return false;}
+        budget.failed(SDL_GetTicks(),delay(budget.attempts));
     }
 }

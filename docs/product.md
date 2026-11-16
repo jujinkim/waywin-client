@@ -22,7 +22,7 @@ Windows는 지원되는 Remote Desktop/RemoteApp 구성이 필요하다. 보조 
 5. **Windows 앱·셸·클립보드 → 앱 목록 새로고침 → 선택 앱 실행**으로 Windows 시작 메뉴에 등록된 앱을 실행한다. 보조 앱이 열거한 앱 ID만 실행 대상으로 허용한다.
 6. **시작 메뉴 / 입력기 설정 / 빠른 설정 / IME 후보 창**으로 해당 Windows 원본 UI를 별도 창에 표시한다. 마우스·휠·키보드·한글 확정 문자열을 같은 세션으로 전달한다. 후보 창은 Windows 앱에서 실제 후보 창을 먼저 연다. 닫기는 해당 셸에 닫기/Escape를 요청한다.
 7. **Windows에서 읽기 / Windows로 보내기**로 텍스트 클립보드를 수동 교환한다. 이 PC의 가져오기/복사도 버튼 동작이다. 최대 UTF-8 64 KiB이며 호스트 간 자동 중계와 내용 저장은 없다.
-8. 네트워크 단절은 1·2·4·8·16초, ±20% 편차로 최대 5회 재시도한다. 시도별 9초 제한을 적용한다. 마지막 화면을 보존하고 500ms 후 어둡게 표시하며 원격 입력을 버린다. **즉시 재시도 / 자동 재시도 중단 / 연결 해제**를 사용할 수 있다. 네트워크 복구·절전 해제 신호는 대기를 건너뛴다. 인증/계정/로그오프/인증서 오류를 계속 자동 재시도하지 않는다.
+8. 네트워크 단절은 1·2·4·8·16초, ±20% 편차로 최대 5회 재시도한다. 시도별 9초 제한을 적용한다. 마지막 화면을 보존하고 500ms 후 어둡게 표시하며 원격 입력을 버린다. **즉시 재시도 / 자동 재시도 중단 / 연결 해제**를 사용할 수 있다. 네트워크 복구·절전 해제 신호는 자동 재시도의 대기만 단축하며 횟수를 초기화하지 않는다. 사용자 중단과 5회 소진 후에는 수동 재시도만 새 예산을 부여한다. 접속 성공 시 다음 단절의 예산을 초기화한다. 인증/계정/로그오프/인증서 오류를 계속 자동 재시도하지 않는다.
 9. **모드 전환**은 같은 호스트에 다른 모드로 재접속하며 앱 실행을 반복하지 않는다. 보조 앱 세션 ID/인스턴스 변경을 알린다. 실제 작업 보존은 Windows 정책에 따라 직접 확인한다.
 10. 엔진 충돌은 원격 앱 실행 없이 한 번 복구한다. 인증은 키링 또는 입력창으로 받으며 반복 충돌은 멈춘다. 비밀번호 변경은 **검증 도구 → 저장 비밀번호 삭제** 후 다시 연결한다.
 
@@ -34,9 +34,17 @@ Windows는 지원되는 Remote Desktop/RemoteApp 구성이 필요하다. 보조 
 
 ## 원본 셸 화면의 범위
 
-셸 창은 같은 RDP의 WayWin DVC로 전송한다. 추가 수신 포트는 없다. 현재 Windows 세션의 승인된 셸 창을 PrintWindow·WIC JPEG로 캡처하며 최대 4회/초, 너비 1600px이다. 입력은 원래 창 크기에 대응한다. 일반 RDP/RAIL은 별도 기본 화면 전송 경로다.
+셸 창은 같은 RDP의 WayWin DVC로 전송한다. 추가 수신 포트는 없다. 현재 Windows 세션의 승인된 셸 창을 별도 Companion 자식 프로세스에서 PrintWindow·WIC JPEG로 캡처한다. 자식은 재사용하며 한 번에 하나만 처리한다. 원본 면적은 16,777,216픽셀, 자식 메모리는 256MiB, JPEG 너비는 1600px로 제한한다. 5초 시간 초과·자식 충돌·IPC 오류 시 자식을 회수하고 열린 셸 화면을 정리한다. 사용자가 셸을 다시 열어야 재시작한다. 일반 캡처 실패도 해당 창을 제거하고 첫 프레임 전부터 GUI에 오류를 표시한다.
+
+프레임 상한은 **창마다가 아닌 호스트 합계 4fps**다. 활성 창과 배경 창이 있으면 활성 3fps + 배경 전체 1fps, 활성 창만 있으면 4fps, 활성 창이 없으면 보이는 창 전체 1fps로 배분한다. 최소화·숨김 창은 0fps다. 배경 창은 순환하고 새 창의 첫 프레임은 다음 슬롯을 우선 사용한다. 지연된 슬롯을 몰아서 실행하지 않는다. Linux 창의 활성화·최소화 상태만 우선순위로 전달하며 이 알림으로 Windows 포커스를 변경하지 않는다. 입력 좌표는 원래 창 크기에 대응한다. 일반 RDP/RAIL의 화면 정책은 이번 제한 대상에 포함하지 않는다.
+
+새 셸 조작은 입력 완료 응답과 우선 배분을 지원하는 Companion이 필요하다. 구형 Companion이면 업데이트 안내와 함께 셸 버튼을 비활성화하며 일반 RDP, 앱 목록과 클립보드는 유지한다. 구형 클라이언트의 빈 Hello는 계속 허용하며 이 경우 입력 성공 응답을 보내지 않고 합계 4fps 순환 캡처를 사용한다.
 
 Windows 빌드·정책·DWM에 따라 검색·캡처·포커스·입력이 거부될 수 있다. 시간 초과와 접근 실패는 GUI에서 표시한다. 검은 화면이나 입력 실패는 P09 실패로 기록한다. URI 호출·캡처 API 성공만으로 원본 UI 호환성을 합격 처리하지 않는다. 실제 Windows 셸 호환성은 이번 macOS 환경에서 확인하지 못했다.
+
+구형 Companion 안내 화면 (macOS offscreen의 합성 상태이며 실제 Windows 연결 결과가 아님):
+
+![구형 Companion의 셸 비활성화와 앱·클립보드 유지](screenshots/companion-update.png)
 
 ## 제품 안에서 실환경 검증
 
@@ -62,6 +70,10 @@ P01–P10, 셸 3종, M01–M06의 절차·종료 조건을 읽고 관측·증거
 | cmake/FreeRDPProduct.cmake | 프로브와 분리한 제품 빌드 프로필 |
 
 네트워크와 원격 화면은 호스트별 프로세스에서 처리한다. 셸 JPEG 디코딩/표시도 관리 GUI와 별도 프로세스다. 부모 파이프 EOF 시 종료하며 Linux 자식은 parent-death signal을 적용한다. 세션 그룹은 3초 유예 후 회수한다. setsid로 이탈한 모든 후손에 대한 cgroup 보장은 기존 별도 실환경 과제로 유지한다.
+
+창·아이콘 ID는 호스트별 각각 1,024개로 제한한다. 삭제·세대 변경·종료 시 제목과 이미지, 보류 요청을 정리한다. 재연결 중 기존 창 ID는 보존한다. 이미지 캐시는 16MiB이며 오래 사용하지 않은 이미지부터 제거하고 ID를 표시한다. 등록하지 않은 ID의 메타데이터는 저장하지 않는다. ID 상한 초과는 해당 호스트 연결을 종료한다.
+
+입력 전송은 단계마다 일반 256KiB·128개 명령과 해제·닫기 등 제어용 64KiB·32개 명령으로 제한한다. 일반 미처리 요청은 호스트 합계 64개다. 마우스 이동은 대상별 최신 좌표로 합치고 키 누름/해제는 FIFO 순서를 유지한다. 상한에 도달하면 새 일반 입력을 잠그고 모든 단계가 128KiB 미만이며 요청 여유가 생기면 재개한다. 5초 막힘이나 입력 완료 응답 지연은 연결 종료 후 3초 유예 정리로 처리하며 자동 충돌 복구를 하지 않는다. 제어 공간까지 소진되면 즉시 정리를 시작한다.
 
 앱 로컬 데이터에 호스트 설정·실행 UUID별 기록·호스트별 검증 JSON·인증서를 저장한다. 폴더 0700, 파일 0600, 원자적 교체와 단일 관리자 잠금을 사용한다. 비밀번호는 인자·환경·기록에 넣지 않는다. 제목·아이콘·셸 이미지·클립보드는 메모리의 일시적 메시지이며 진단 파일에 기록하지 않는다. 사용자 관측 내용은 그대로 저장한다. 자동 업로드는 없다.
 
@@ -90,8 +102,8 @@ cmake --build build/windows-native --config Release
 
 Windows x64는 MinGW 교차 컴파일도 지원한다. MSVC·Ubuntu 실제 빌드는 별도 확인이 필요하다. macOS는 Qt 6/QtKeychain/SDL3/SDL3_ttf/CMake/Ninja와 FreeRDP 의존성을 사용한다.
 
-FreeRDP 커밋을 고정하고 관측·제품 패치를 순서대로 적용한다. 패치 변경 후에는 새 빌드 디렉터리를 사용한다. 개발자는 runtime/와 검토한 checkout을 동기화한 뒤 tools/update_product_patch.py로 패치·lockfile을 재생성한다. 원본+프로브+제품 패치의 바이트 일치까지 확인한 checkout에만 검토 표식을 갱신한다. Python은 개발 테스트·패치 제작에서만 사용한다.
+FreeRDP 커밋을 고정하고 관측·제품 패치를 순서대로 적용한다. 패치 변경 후에는 새 빌드 디렉터리를 사용한다. 개발자는 runtime/ 및 protocol/의 공용 헤더와 검토한 checkout을 동기화한 뒤 tools/update_product_patch.py로 패치·lockfile을 재생성한다. 원본+프로브+제품 패치의 바이트 일치까지 확인한 checkout에만 검토 표식을 갱신한다. Python은 개발 테스트·패치 제작에서만 사용한다.
 
 기본 프로필은 소프트웨어 그래픽과 암호 인증이다. FFmpeg/OpenH264·Kerberos·파일/드라이브/마이크/프린터 공유는 기본 빌드에 포함하지 않는다. 1080p/30fps는 실환경 측정 목표이며 검증한 성능 수치가 아니다.
 
-API 근거: [DVC 서버](https://learn.microsoft.com/en-us/windows/win32/termserv/dvc-server-apis), [WTS 조각 읽기](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsvirtualchannelread), [RAIL 알림 이벤트](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdperp/cce43d39-cacc-4d28-aa5b-3af736a89924).
+API 근거: [Job Object와 부모 종료 시 회수](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects), [제한된 핸들·Job 목록 상속](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute), [DVC 서버](https://learn.microsoft.com/en-us/windows/win32/termserv/dvc-server-apis), [WTS 조각 읽기](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsvirtualchannelread), [RAIL 알림 이벤트](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdperp/cce43d39-cacc-4d28-aa5b-3af736a89924).

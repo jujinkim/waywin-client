@@ -21,13 +21,14 @@ def main():
     if revision != COMMIT:
         raise SystemExit("Runtime checkout must be at the pinned commit.")
     files = set(subprocess.check_output(["git", "diff", "--name-only"], cwd=source, text=True).splitlines())
-    for name in ("waywin_product.cpp", "waywin_product.hpp", "waywin_wire.hpp"):
+    for name in ("waywin_product.cpp", "waywin_product.hpp", "waywin_wire.hpp", "waywin_policy.hpp"):
         files.add("client/SDL/SDL3/" + name)
     for name in ("waywin_product.cpp", "waywin_product.hpp"):
         if (ROOT / "runtime" / name).read_bytes() != (source / "client/SDL/SDL3" / name).read_bytes():
             raise SystemExit(f"Synchronize runtime/{name} with the reviewed checkout first.")
-    if (ROOT / "protocol/waywin_wire.hpp").read_bytes() != (source / "client/SDL/SDL3/waywin_wire.hpp").read_bytes():
-        raise SystemExit("Synchronize the shared wire header first.")
+    for name in ("waywin_wire.hpp", "waywin_policy.hpp"):
+        if (ROOT / "protocol" / name).read_bytes() != (source / "client/SDL/SDL3" / name).read_bytes():
+            raise SystemExit(f"Synchronize the shared {name} header first.")
     with tempfile.TemporaryDirectory(prefix="waywin-patch-") as directory:
         base = Path(directory)
         subprocess.run(["git", "init", "-q"], cwd=base, check=True)

@@ -235,7 +235,7 @@ private slots:
         QCOMPARE(b.state(),QProcess::Running);const auto output=a.readAllStandardOutput();
         b.closeWriteChannel();QVERIFY(b.waitForFinished(5000));QCOMPARE(b.exitCode(),0);
         Decoder decoder;auto commands=decoder.feed(reinterpret_cast<const uint8_t*>(output.constData()),size_t(output.size()));
-        for(const auto&message:commands)QVERIFY(message.type==Pointer||message.type==Key||message.type==SurfaceClose);
+        for(const auto&message:commands)QVERIFY(message.type==Pointer||message.type==Key||message.type==SurfaceClose||message.type==SurfaceState);
         QVERIFY(!output.contains(jpeg)); // The worker returns commands, never the image payload.
     }
     void binaryProtocolBoundaries(){
@@ -256,7 +256,7 @@ private slots:
         using namespace WayWinWire;
         QTemporaryDir temp;WayWin::Host host;host.id="host-a";host.name="A";WayWin::Session session(host,temp.path());
         session.events.setFileName(temp.filePath("events.jsonl"));QVERIFY(session.events.open(QIODevice::WriteOnly));
-        session.runId="run-a";
+        session.runId="run-a";session.windows.insert(77);session.icons.insert(quint64(77)<<32);
         Message title{Title,77,1,{}};put(title.data,0);string(title.data,"CONFIDENTIAL_DOCUMENT");
         auto bytes=encode(title);auto line=QByteArray::fromStdString("WAYWIN_UI_V2 "+hex(bytes)+"\n");
         WayWin::EventDecoder filter;auto event=filter.feed(line);QCOMPARE(event.size(),1);QCOMPARE(event[0]["type"].toString(),QString("ui"));
@@ -294,6 +294,163 @@ private slots:
         QCOMPARE(panel.findChild<QListWidget*>("remoteApps")->count(),1);
         panel.setSession(&b);QCOMPARE(panel.findChild<QListWidget*>("remoteApps")->count(),0);
     }
+
+    void retryBudgetWithFakeClock(){
+        using namespace WayWinPolicy;
+        RetryBudget retry;retry.disconnected(1000,1000);QVERIFY(!retry.begin(1999));
+        retry.stop();for(int i=0;i<50;++i)retry.wake(2000+i);QCOMPARE(retry.state,RetryState::Stopped);QVERIFY(!retry.begin(3000));
+        retry.manual(3000);
+        for(unsigned n=1;n<=5;++n){retry.wake(3000+n);QVERIFY(retry.begin(3000+n));QCOMPARE(retry.attempts,n);retry.failed(3000+n,10000);}
+        QCOMPARE(retry.state,RetryState::Exhausted);
+        for(int i=0;i<50;++i){retry.wake(100000+i);QVERIFY(!retry.begin(100000+i));}QCOMPARE(retry.attempts,5u);
+        retry.manual(200000);QVERIFY(retry.begin(200000));QCOMPARE(retry.attempts,1u);
+        retry.succeeded();retry.disconnected(300000,0);QVERIFY(retry.begin(300000));QCOMPARE(retry.attempts,1u);
+        retry.forbid();retry.wake(500000);retry.manual(500000);QVERIFY(!retry.begin(500000));
+    }
+    void boundedQueueAndInputOrdering(){
+        using namespace WayWinWire;using namespace WayWinPolicy;
+        Queue queue;
+        auto pointer=[](uint32_t request,uint32_t action,uint32_t target=7){Message m{Pointer,request,4,{}};for(auto n:{target,100u,200u,action})put(m.data,n);return packet(std::to_string(request),m);};
+        QCOMPARE(queue.push(pointer(1,0)),Admission::Accepted);queue.push(pointer(2,0));QCOMPARE(queue.size(),size_t(1));QCOMPARE(queue.replacedRequest,1u);
+        queue.push(pointer(3,1));queue.push(pointer(4,0));queue.push(pointer(5,0));queue.push(pointer(6,2));
+        std::vector<uint32_t> ordered;while(!queue.empty()){ordered.push_back(queue.front().request);queue.pop();}
+        QCOMPARE(ordered,std::vector<uint32_t>({2,3,5,6})); // A release never passes the down event or intervening motion.
+        for(size_t i=0;i<NormalCommands;++i)QCOMPARE(queue.push({"normal"}),Admission::Accepted);
+        QCOMPARE(queue.push({"extra"}),Admission::Full);
+        for(size_t i=0;i<ControlCommands;++i)QCOMPARE(queue.push({"release",true}),Admission::Accepted);
+        QCOMPARE(queue.push({"overflow",true}),Admission::ControlFull);QCOMPARE(queue.size(),NormalCommands+ControlCommands);
+        queue.clear();QCOMPARE(queue.push({std::string(NormalBytes,'x')}),Admission::Accepted);QCOMPARE(queue.push({"x"}),Admission::Full);
+        QCOMPARE(queue.push({std::string(ControlBytes,'x'),true}),Admission::Accepted);QCOMPARE(queue.bytes(),NormalBytes+ControlBytes);
+        QCOMPARE(queue.push({"x",true}),Admission::ControlFull);queue.discardPending(false);QVERIFY(queue.low());QCOMPARE(queue.bytes(),size_t(0));
+        queue.push(pointer(10,0));queue.push(pointer(11,0),true);QCOMPARE(queue.size(),size_t(2)); // Never rewrite a partially transmitted command.
+        queue.clear();auto old=pointer(12,0),fresh=pointer(13,0);fresh.epoch=5;queue.push(old);queue.push(fresh);QCOMPARE(queue.size(),size_t(2));
+        queue.discardPending(true);QCOMPARE(queue.size(),size_t(1));
+        Message key{Key,20,5,{}};put(key.data,7);put(key.data,16);put(key.data,0);
+        auto wire=encode(key);auto command="20 0 0 5 "+hex(wire);
+        auto parsed=commandPacket(command);QVERIFY(parsed.control);QCOMPARE(parsed.epoch,5u);QCOMPARE(parsed.request,20u);
+        QCOMPARE(commandPacket("1 77 0 5 21").request,21u);QVERIFY(commandPacket("4 77 0 5 22").control);
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error,commandPacket("1 77 0 5 4294967296"));
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error,commandPacket("20 0 0 5 invalid"));
+        Stall stall;stall.set(true,100);QVERIFY(!stall.expired(5099));QVERIFY(stall.expired(5100));stall.set(false,5100);QVERIFY(!stall.expired(9000));
+    }
+    void captureScheduleWithFakeClock(){
+        using namespace WayWinWire;using namespace WayWinPolicy;
+        CaptureScheduler scheduler;scheduler.add(1);scheduler.add(2);scheduler.add(3);scheduler.state(1,Active);
+        for(uint64_t t=0;t<2000;t+=250)QVERIFY(scheduler.take(t,true)); // Consume initial frames.
+        std::map<uint32_t,unsigned> frames;
+        for(uint64_t t=2000;t<6000;t+=250){auto id=scheduler.take(t,true);QVERIFY(id);++frames[id];QCOMPARE(scheduler.take(t,true),0u);}
+        QCOMPARE(frames[1],12u);QCOMPARE(frames[2],2u);QCOMPARE(frames[3],2u);
+        scheduler.state(2,Active);frames.clear();for(uint64_t t=6000;t<10000;t+=250)++frames[scheduler.take(t,true)];QCOMPARE(frames[2],12u);QCOMPARE(frames[1]+frames[3],4u);
+        scheduler.state(2,Hidden);scheduler.state(1,Hidden);scheduler.state(3,Hidden);QCOMPARE(scheduler.take(10000,true),0u);
+        scheduler.state(3,Background);QCOMPARE(scheduler.take(10000,true),3u);QCOMPARE(scheduler.take(10250,true),0u);QCOMPARE(scheduler.take(11000,true),3u);
+        scheduler.add(4);QCOMPARE(scheduler.take(12000,true),4u); // New first frame wins the next available slot.
+        scheduler.state(3,Hidden);scheduler.state(4,Active);frames.clear();for(uint64_t t=13000;t<14000;t+=250)++frames[scheduler.take(t,true)];QCOMPARE(frames[4],4u);
+        QCOMPARE(scheduler.take(60000,true),4u);QCOMPARE(scheduler.take(60000,true),0u); // No catch-up burst.
+        scheduler.clear();for(uint32_t i=1;i<=8;++i)scheduler.add(i);
+        frames.clear();for(uint64_t t=0;t<8000;t+=250)++frames[scheduler.take(t,false)];for(uint32_t i=1;i<=8;++i)QCOMPARE(frames[i],4u);
+        CaptureDeadline deadline;QVERIFY(deadline.start(0));QVERIFY(!deadline.start(1));QVERIFY(!deadline.expired(4999));QVERIFY(deadline.expired(5000));deadline.fault();QVERIFY(!deadline.available());QVERIFY(!deadline.start(9000));deadline.reopen();QVERIFY(deadline.start(9000));deadline.complete();QVERIFY(deadline.available());
+    }
+    void cacheLifetimesAndLimits(){
+        using namespace WayWinWire;
+        QTemporaryDir temp;WayWin::Host host;WayWin::Session s(host,temp.path());
+        s.events.setFileName(temp.filePath("events"));QVERIFY(s.events.open(QIODevice::WriteOnly));
+        auto event=[&](const char*type,uint32_t window,uint32_t icon=0){s.pending=QJsonDocument(QJsonObject{{"type",type},{"window",double(window)},{"icon",double(icon)}}).toJson(QJsonDocument::Compact)+'\n';s.receive();};
+        auto deliver=[&](Message m){auto b=encode(m);s.receiveTransient(QByteArray(reinterpret_cast<const char*>(b.data()),qsizetype(b.size())));};
+        auto title=[&](uint32_t type,uint32_t id,uint32_t icon){Message m{type,id,s.epoch,{}};put(m.data,icon);string(m.data,"PRIVATE");deliver(m);};
+        auto image=[&](uint32_t id){Message m{Icon,10,s.epoch,{}};put(m.data,id);put(m.data,256);put(m.data,256);m.data.resize(12+256*256*4,1);deliver(m);};
+        title(Title,10,0);title(TrayTitle,10,0);image(0);QVERIFY(s.windowTitles.isEmpty());QVERIFY(s.trayTitles.isEmpty());QVERIFY(s.trayImages.isEmpty());
+        for(int n=0;n<100;++n){event("window-create",10);event("notify-create",10,0);title(Title,10,0);title(TrayTitle,10,0);image(0);event("window-delete",10);QVERIFY(s.windowTitles.isEmpty());QVERIFY(s.trayTitles.isEmpty());QVERIFY(s.trayImages.isEmpty());QVERIFY(s.icons.isEmpty());QCOMPARE(s.imageBytes,qsizetype(0));}
+        event("window-create",10);
+        for(uint32_t i=0;i<63;++i){event("notify-create",10,i);image(i);}
+        const auto first=quint64(10)<<32;QVERIFY(!s.trayImage(first).isEmpty());
+        event("notify-create",10,63);image(63);QVERIFY(s.trayImages.contains(first));QVERIFY(!s.trayImages.contains(first|1));
+        QVERIFY(s.imageBytes<=qsizetype(WayWinPolicy::ImageBytes));QCOMPARE(s.trayImages.size(),63);
+        title(TrayTitle,10,0);event("notify-delete",10,0);QVERIFY(!s.trayTitles.contains(first));QVERIFY(!s.trayImages.contains(first));
+        s.requests[20]=100;s.inputRequests.insert(20);s.controlRequests.insert(21);s.inputDeadlines[20]=100;
+        Message retry{Retry,0,2,{}};for(auto n:{1u,1u,1u,0u})put(retry.data,n);deliver(retry);
+        QVERIFY(s.windows.contains(10));QVERIFY(s.windowTitles.isEmpty());QVERIFY(s.icons.isEmpty());QVERIFY(s.trayImages.isEmpty());QVERIFY(s.requests.isEmpty());QVERIFY(s.inputRequests.isEmpty());QVERIFY(s.controlRequests.isEmpty());QVERIFY(s.inputDeadlines.isEmpty());
+        for(uint32_t i=0;i<WayWinPolicy::IdLimit;++i)event("window-create",100+i);
+        QVERIFY(s.failed);QVERIFY(s.windows.size()<=int(WayWinPolicy::IdLimit));
+        s.failed=false;s.windows.clear();for(uint32_t i=0;i<=WayWinPolicy::IdLimit;++i)event("notify-create",20,i);
+        QVERIFY(s.failed);QCOMPARE(s.icons.size(),int(WayWinPolicy::IdLimit));
+        s.finish(0,QProcess::NormalExit);QVERIFY(s.windows.isEmpty());QVERIFY(s.icons.isEmpty());QVERIFY(s.windowTitles.isEmpty());QVERIFY(s.trayTitles.isEmpty());
+    }
+    void inputCompletionAndOldCompanion(){
+        using namespace WayWinWire;
+        QTemporaryDir temp;WayWin::Host host;WayWin::Session s(host,temp.path());
+        auto deliver=[&](Message m){auto b=encode(m);s.receiveTransient(QByteArray(reinterpret_cast<const char*>(b.data()),qsizetype(b.size())));};
+        Message ready{Ready,1,1,{}};put(ready.data,1);string(ready.data,"test");put(ready.data,0x3f);deliver(ready);
+        QVERIFY(s.companionReady);QVERIFY(!s.shellReady);QVERIFY(s.companionStatus.contains("업데이트"));
+        s.inputRequests.insert(20);s.requests[20]=100;s.inputDeadlines[20]=100;
+        QSignalSpy changed(&s,&WayWin::Session::changed),companion(&s,&WayWin::Session::companionChanged);
+        auto previous=s.companionStatus;deliver({InputAck,20,1,{}});QVERIFY(s.inputRequests.isEmpty());QVERIFY(s.requests.isEmpty());QVERIFY(s.inputDeadlines.isEmpty());QCOMPARE(changed.size(),0);QCOMPARE(companion.size(),0);QCOMPARE(s.companionStatus,previous);
+        Message flow{Flow,0,1,{}};put(flow.data,2);put(flow.data,1);deliver(flow);QVERIFY(s.inputBlocked);
+        s.requests[21]=100;s.inputRequests.insert(21);deliver({InputAck,21,1,{}});QVERIFY(s.inputBlocked); // Acknowledgment cannot clear a blocked downstream stage.
+        Message load{Flow,0,1,{}};put(load.data,1);put(load.data,3);deliver(load);
+        flow.data.clear();put(flow.data,2);put(flow.data,0);deliver(flow);QVERIFY(s.inputBlocked); // Another stage still exceeds the resume watermark.
+        load.data.clear();put(load.data,1);put(load.data,0);deliver(load);QVERIFY(!s.inputBlocked);
+        s.state="연결됨";WayWin::Companion panel;panel.setSession(&s);panel.show();QVERIFY(panel.findChild<QListWidget*>("remoteApps")->isEnabled());
+        if(qEnvironmentVariableIsSet("WAYWIN_TEST_ARTIFACTS")){panel.adjustSize();QCoreApplication::processEvents();panel.grab().save(qEnvironmentVariable("WAYWIN_TEST_ARTIFACTS")+"/companion-update.png");}
+        Message gone{SurfaceGone,99,1,{}};string(gone.data,"Synthetic capture failure before first frame");deliver(gone);QVERIFY(s.companionStatus.contains("before first frame"));
+    }
+    void surfaceVisibilityEventsAndHiddenFrames(){
+        using namespace WayWinWire;
+        int pipe[2];QVERIFY(::pipe(pipe)==0);::fcntl(pipe[0],F_SETFL,O_NONBLOCK);
+        WayWin::Host host;host.name="Synthetic host";WayWin::Session s(host,{});
+        s.surfaceProxy=s.companionReady=s.shellReady=true;s.state="연결됨";s.epoch=10;
+        s.proxyWriter=new WayWin::CommandWriter(pipe[1],&s);
+        WayWin::Companion panel;panel.setSession(&s);
+        QImage image(40,30,QImage::Format_RGB32);image.fill(Qt::blue);QByteArray jpeg;QBuffer buffer(&jpeg);buffer.open(QIODevice::WriteOnly);QVERIFY(image.save(&buffer,"JPEG"));
+        Message frame{Frame,99,10,{}};put(frame.data,1);put(frame.data,40);put(frame.data,30);frame.data.insert(frame.data.end(),jpeg.begin(),jpeg.end());auto encoded=encode(frame);
+        auto deliver=[&]{emit s.transient(QByteArray(reinterpret_cast<const char*>(encoded.data()),qsizetype(encoded.size())));QCoreApplication::processEvents();};
+        deliver();QWidget *surface=nullptr;for(auto widget:QApplication::topLevelWidgets())if(widget->windowTitle().startsWith("Synthetic host ·"))surface=widget;
+        QVERIFY(surface);QVERIFY(surface->isVisible());surface->activateWindow();QCoreApplication::processEvents();
+        if(qEnvironmentVariableIsSet("WAYWIN_TEST_ARTIFACTS"))surface->grab().save(qEnvironmentVariable("WAYWIN_TEST_ARTIFACTS")+"/shell-synthetic.png");
+        surface->showMinimized();QCoreApplication::processEvents();surface->showNormal();QCoreApplication::processEvents();
+        surface->hide();QCoreApplication::processEvents();deliver();QVERIFY(!surface->isVisible()); // A late frame cannot undo Hide.
+        surface->close();QCoreApplication::sendPostedEvents(nullptr,QEvent::DeferredDelete);
+        QByteArray output;char bytes[4096];ssize_t count=0;while((count=::read(pipe[0],bytes,sizeof(bytes)))>0)output.append(bytes,count);
+        Decoder decoder;auto commands=decoder.feed(reinterpret_cast<const uint8_t*>(output.constData()),size_t(output.size()));bool hidden=false,visible=false,active=false;
+        for(const auto&m:commands)if(m.type==SurfaceState){Reader read(m.data);QCOMPARE(read.number(),99u);auto state=read.number();QVERIFY(state<=Active);hidden|=state==Hidden;visible|=state!=Hidden;active|=state==Active;}
+        QVERIFY(hidden);QVERIFY(visible);QVERIFY(active);
+        delete s.proxyWriter;s.proxyWriter=nullptr;::close(pipe[0]);::close(pipe[1]);
+    }
+    void unresponsiveCompanionStopsOnlyThisHost_data(){QTest::addColumn<bool>("freezeWorker");QTest::newRow("unresponsive-companion")<<false;QTest::newRow("stopped-session-worker")<<true;}
+    void unresponsiveCompanionStopsOnlyThisHost(){
+        using namespace WayWinWire;
+        QFETCH(bool,freezeWorker);
+        QTemporaryDir temp;WayWin::Host host;WayWin::Session s(host,temp.path());QProcess other;
+        const auto program=QStringLiteral(WAYWIN_EXECUTABLE);const QStringList arguments={"--session-worker","/bin/sh","-c","read credential; trap '' TERM; sleep 60"};
+        s.worker.start(program,arguments);QVERIFY(s.worker.waitForStarted());s.commandWriter.enqueue({"synthetic\n",true});
+        other.start(program,arguments);QVERIFY(other.waitForStarted());other.write("synthetic\n");
+        QTRY_VERIFY_WITH_TIMEOUT(s.pid>0,3000);
+        if(freezeWorker)QCOMPARE(::kill(s.worker.processId(),SIGSTOP),0);
+        s.state="연결됨";s.companionReady=s.shellReady=true;
+        std::vector<uint32_t> ids;
+        s.windows.insert(77);
+        for(unsigned i=0;i<64;++i){if(i%2){s.command(1,77);QVERIFY(s.inputRequests.contains(s.nextRequest));}else{std::vector<uint8_t>d;put(d,1);put(d,16);put(d,1);auto id=s.request(Key,d);QVERIFY(id);ids.push_back(id);}}
+        QCOMPARE(s.requests.size(),64);QVERIFY(s.inputBlocked);QCOMPARE(s.request(Text,{}),0u);
+        std::vector<uint8_t>release;put(release,1);put(release,16);put(release,0);QVERIFY(s.request(Key,release));QCOMPARE(s.controlRequests.size(),1);
+        QElapsedTimer elapsed;elapsed.start();QTRY_VERIFY_WITH_TIMEOUT(s.failed,6500);QVERIFY(elapsed.elapsed()>=4500);
+        QTRY_COMPARE_WITH_TIMEOUT(s.worker.state(),QProcess::NotRunning,4500);QVERIFY(elapsed.elapsed()<10000);QCOMPARE(s.crashRestarts,0u);QCOMPARE(other.state(),QProcess::Running);
+        other.closeWriteChannel();QVERIFY(other.waitForFinished(4500));
+    }
+    void unreadEngineHasBoundedTransport(){
+        using namespace WayWinWire;
+        QProcess worker,other;const auto program=QStringLiteral(WAYWIN_EXECUTABLE);
+        const QStringList args={"--session-worker","/bin/sh","-c","read credential; trap '' TERM; sleep 60"};
+        worker.start(program,args);QVERIFY(worker.waitForStarted());worker.write("synthetic\n");
+        other.start(program,args);QVERIFY(other.waitForStarted());other.write("synthetic\n");QTest::qWait(100);
+        WayWin::CommandWriter writer(&worker);bool failed=false;writer.fault=[&]{failed=true;worker.closeWriteChannel();};
+        Message text{Text,1,1,{}};put(text.data,1);string(text.data,std::string(4096,'x'));auto bytes=encode(text);
+        auto command="20 0 0 1 "+hex(bytes);size_t maximum=0;
+        for(int n=0;n<100;++n){writer.enqueue(WayWinPolicy::commandPacket(command));maximum=std::max(maximum,writer.bytes());}
+        QVERIFY(maximum<=WayWinPolicy::NormalBytes);QVERIFY(worker.bytesToWrite()<=qint64(command.size()+1));
+        QTRY_VERIFY_WITH_TIMEOUT(failed||worker.state()==QProcess::NotRunning,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(worker.state(),QProcess::NotRunning,4500);QCOMPARE(other.state(),QProcess::Running);
+        other.closeWriteChannel();QVERIFY(other.waitForFinished(4500));
+    }
+
     void rejectUntrustedManifest(){QTemporaryDir temp;auto f=temp.filePath("waywin-runtime.json");QVERIFY(WayWin::saveJson(f,{{"schema",2}},nullptr));QString error;QVERIFY(WayWin::verifyRuntime(f,&error).isEmpty());QVERIFY(!error.isEmpty());}
 };
 QTEST_MAIN(ProductTests)

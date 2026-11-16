@@ -2,6 +2,34 @@
 
 현재 실환경 검증은 [제품 GUI](product.md)에서 실행하고 기록할 수 있다. 아래는 기존 개발용 프로브의 재현·비교 절차이며 제품 실행에 Python이 필요한 것은 아니다.
 
+## 제품 자원 제한과 셸 캡처 검증
+
+`ctest --test-dir build/product --output-on-failure`는 캐시 삭제·ID/이미지 예산,
+가짜 시계 재시도 예산과 프레임 배분, FIFO/이동 병합/제어 여유 공간, 입력 완료
+응답과 호스트 격리, 읽지 않는 엔진과 응답하지 않는 보조 앱 모의를 검사한다.
+macOS에서의 이 결과는 Linux/Windows 실제 연결 결과와 구분한다.
+
+Windows 캡처 프로세스의 수명 검사는 실제 Windows에서 다음과 같이 실행한다.
+Python의 POSIX 프로브 테스트는 이 명령에 포함하지 않는다.
+
+```powershell
+cmake -S . -B build/windows-tests -A x64 -DBUILD_TESTING=ON
+cmake --build build/windows-tests --config Release
+ctest --test-dir build/windows-tests -C Release -R capture-process-contracts --output-on-failure
+```
+
+이 검사는 제품의 프로세스 소유 코드를 사용하고 캡처 결과만 가짜 워커로 대체한다.
+재사용·일반 실패·정지·충돌·잘못된 IPC·부모 강제 종료, 256MiB 제한과 제한된
+핸들 상속, 장애 후 명시적 재개 전 재시작 금지를 검사한다. Windows SDK·C++와
+CMake 구성용 Python 3.10 이상이 필요하다. 교차 컴파일만으로 실행 통과를 기록하지 않는다.
+
+실제 셸에서는 두 창을 열어 활성 전환·최소화·복원·신규 첫 프레임·배경 순환을
+관측한다. 호스트 합계 최대 4fps, 활성 3fps/배경 합계 1fps, 활성 없음 합계
+1fps, 숨김/최소화 0fps를 확인한다. 캡처 시간 초과 시 5초 후 열린 셸이 정리되고
+사용자가 다시 열기 전 자식이 재생성되지 않아야 한다. 일반 캡처 실패는 첫 프레임
+이전에도 오류를 표시해야 한다. 고아 자식·입력 해제 실패·다른 호스트 정지가 보이면
+실패로 기록하고 조작을 종료한다. 원본 이미지·제목·입력 내용을 진단 기록에 넣지 않는다.
+
 이 도구는 실제 환경의 가능성을 조사하기 위한 개발용 도구이다. 제품의 Qt 관리 GUI, 키링, IPC, DVC 보조 앱, 트레이 UI, 모드 전환을 구현한 것으로 취급하지 않는다. 목표는 R3–R7의 위험을 실제 Ubuntu/Windows에서 확인할 수 있게 하는 것이다.
 
 ## 구성과 변경 범위

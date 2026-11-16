@@ -1,12 +1,13 @@
 --- a/client/SDL/SDL3/CMakeLists.txt
 +++ b/client/SDL/SDL3/CMakeLists.txt
-@@ -48,6 +48,9 @@
+@@ -48,6 +48,10 @@
      sdl_web_clip_offers.hpp
      sdl_context.hpp
      sdl_context.cpp
 +    waywin_product.cpp
 +    waywin_product.hpp
 +    waywin_wire.hpp
++    waywin_policy.hpp
      sdl_rail.hpp
      sdl_rail.cpp
      sdl_rail_platform.hpp
@@ -411,11 +412,159 @@
  	return true;
  }
 --- /dev/null
++++ b/client/SDL/SDL3/waywin_policy.hpp
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "waywin_wire.hpp"
++#include <deque>
++#include <map>
++#include <cstddef>
++#include <utility>
++#include <sstream>
++namespace WayWinPolicy {
++constexpr size_t IdLimit=1024, ImageBytes=16*1024*1024;
++constexpr size_t NormalBytes=256*1024, NormalCommands=128;
++constexpr size_t ControlBytes=64*1024, ControlCommands=32, ResumeBytes=128*1024;
++constexpr size_t PendingRequests=64;
++constexpr uint64_t StallMs=5000, GraceMs=3000, CapturePixels=16777216;
++constexpr size_t CaptureMemory=256*1024*1024;
++inline bool input(uint32_t type) {return type==WayWinWire::Pointer||type==WayWinWire::Key||type==WayWinWire::Text;}
++struct Packet {
++    std::string bytes;
++    bool control=false, motion=false;
++    uint32_t target=0, epoch=0, request=0;
++};
++inline Packet packet(std::string bytes,const WayWinWire::Message&m) {
++    Packet p{std::move(bytes),m.type==WayWinWire::SurfaceClose||m.type==WayWinWire::SurfaceState,false,0,m.epoch,m.request};
++    if(m.data.size()>=4)p.target=WayWinWire::get(m.data.data());
++    if(m.type==WayWinWire::Key&&m.data.size()==12)p.control=WayWinWire::get(m.data.data()+8)==0;
++    if(m.type==WayWinWire::Pointer&&m.data.size()==16){auto action=WayWinWire::get(m.data.data()+12);p.control=action==2||action==4;p.motion=action==0;}
++    return p;
++}
++constexpr size_t CommandLineBytes=2*(65552+24)+128;
++inline Packet commandPacket(const std::string&line) {
++    if(line.size()>CommandLineBytes)throw std::runtime_error("command limit");
++    unsigned action=0,window=0,icon=0,epoch=0;std::string payload,extra;
++    std::istringstream stream(line);
++    if(!(stream>>action>>window>>icon>>epoch>>payload)||(stream>>extra))throw std::runtime_error("invalid command");
++    if(action==20){auto bytes=WayWinWire::unhex(payload);WayWinWire::Decoder decoder;auto messages=decoder.feed(bytes.data(),bytes.size());
++        if(messages.size()!=1||WayWinWire::encode(messages[0])!=bytes||!WayWinWire::requestType(messages[0].type)||messages[0].epoch!=epoch||messages[0].data.size()>65552)throw std::runtime_error("invalid request");
++        return packet(line+"\n",messages[0]);
++    }
++    if(!((action>=1&&action<=6)||(action>=21&&action<=23)))throw std::runtime_error("invalid action");
++    uint32_t request=0;
++    if(payload!="-"){
++        if(action>=21||!std::all_of(payload.begin(),payload.end(),[](char c){return c>='0'&&c<='9';}))throw std::runtime_error("invalid completion ID");
++        const auto value=std::stoull(payload);if(!value||value>0xffffffffu)throw std::runtime_error("invalid completion ID");request=uint32_t(value);
++    }
++    return {line+"\n",action==4||action>=21,false,window,epoch,request};
++}
++enum class Admission { Accepted, Full, ControlFull };
++// FIFO, including the control reserve: a release can never overtake a press.
++class Queue {
++    std::deque<Packet> items;
++    size_t ordinaryBytes=0,reservedBytes=0,ordinaryCount=0,reservedCount=0;
++    void subtract(const Packet&p){if(p.control){reservedBytes-=p.bytes.size();--reservedCount;}else{ordinaryBytes-=p.bytes.size();--ordinaryCount;}}
++public:
++    uint32_t replacedRequest=0;
++    Admission push(Packet p,bool protectFront=false) {
++        replacedRequest=0;
++        if(p.motion) {
++            for(auto it=items.rbegin();it!=items.rend();++it) {
++                if(it->epoch!=p.epoch)break;
++                if(it->target!=p.target)continue;
++                if(!it->motion||(protectFront && &*it==&items.front()))break;
++                if(ordinaryBytes-it->bytes.size()+p.bytes.size()>NormalBytes)return Admission::Full;
++                ordinaryBytes=ordinaryBytes-it->bytes.size()+p.bytes.size();replacedRequest=it->request;*it=std::move(p);return Admission::Accepted;
++            }
++        }
++        if(p.control){if(reservedBytes+p.bytes.size()>ControlBytes||reservedCount>=ControlCommands)return Admission::ControlFull;reservedBytes+=p.bytes.size();++reservedCount;}
++        else {if(ordinaryBytes+p.bytes.size()>NormalBytes||ordinaryCount>=NormalCommands)return Admission::Full;ordinaryBytes+=p.bytes.size();++ordinaryCount;}
++        items.push_back(std::move(p));return Admission::Accepted;
++    }
++    bool empty()const{return items.empty();}
++    size_t size()const{return items.size();}
++    size_t bytes()const{return ordinaryBytes+reservedBytes;}
++    size_t normalBytes()const{return ordinaryBytes;}
++    bool high()const{return ordinaryBytes>=NormalBytes||ordinaryCount>=NormalCommands;}
++    bool low()const{return bytes()<ResumeBytes&&ordinaryCount<NormalCommands;}
++    Packet& front(){return items.front();}
++    void pop(){subtract(items.front());items.pop_front();}
++    void clear(){items.clear();ordinaryBytes=reservedBytes=ordinaryCount=reservedCount=0;}
++    void discardPending(bool keepFront){if(!keepFront){clear();return;}while(items.size()>1){subtract(items.back());items.pop_back();}}
++};
++class Stall {
++    bool blocked=false;
++    uint64_t since=0;
++public:
++    void set(bool value,uint64_t now){if(value&&!blocked)since=now;blocked=value;}
++    bool active()const{return blocked;}
++    bool expired(uint64_t now)const{return blocked&&now-since>=StallMs;}
++};
++enum class RetryState { Automatic, Stopped, Exhausted, Forbidden };
++class RetryBudget {
++public:
++    RetryState state=RetryState::Automatic;
++    unsigned attempts=0;
++    uint64_t due=0;
++    void disconnected(uint64_t now,unsigned delay){state=RetryState::Automatic;attempts=0;due=now+delay;}
++    void stop(){if(state!=RetryState::Forbidden)state=RetryState::Stopped;}
++    void forbid(){state=RetryState::Forbidden;}
++    void manual(uint64_t now){if(state!=RetryState::Forbidden){attempts=0;state=RetryState::Automatic;due=now;}}
++    void wake(uint64_t now){if(state==RetryState::Automatic)due=now;}
++    bool begin(uint64_t now){if(state!=RetryState::Automatic||now<due)return false;if(attempts>=5){state=RetryState::Exhausted;return false;}++attempts;return true;}
++    void failed(uint64_t now,unsigned delay){if(attempts>=5)state=RetryState::Exhausted;else due=now+delay;}
++    void succeeded(){attempts=0;state=RetryState::Automatic;due=0;}
++};
++// One global 250 ms slot. Slots are discarded when late; no accumulated work.
++class CaptureScheduler {
++    struct Target {uint32_t state;bool first=true;};
++    std::map<uint32_t,Target> targets;
++    uint64_t next=0;
++    uint32_t cursor=0,backgroundCursor=0;
++    unsigned phase=0;
++public:
++    void add(uint32_t id){targets.emplace(id,Target{WayWinWire::Background,true});}
++    void remove(uint32_t id){targets.erase(id);}
++    void clear(){targets.clear();next=0;cursor=backgroundCursor=0;phase=0;}
++    void state(uint32_t id,uint32_t value){auto it=targets.find(id);if(it==targets.end()||value>WayWinWire::Active)return;if(value==WayWinWire::Active)for(auto&entry:targets)if(entry.second.state==WayWinWire::Active)entry.second.state=WayWinWire::Background;it->second.state=value;}
++    uint32_t take(uint64_t now,bool priority) {
++        if(now<next)return 0;
++        bool active=false,background=false;
++        for(const auto&entry:targets){active|=entry.second.state==WayWinWire::Active;background|=entry.second.state==WayWinWire::Background;}
++        if(!active&&!background)return 0;
++        uint32_t wanted=WayWinWire::Background;
++        if(priority&&active){wanted=background&&phase==3?WayWinWire::Background:WayWinWire::Active;next=now+250;phase=(phase+1)%4;}
++        else {next=now+(priority?1000:250);phase=0;}
++        // First frames get the next slot, including while the active window is busy.
++        for(auto&entry:targets)if(entry.second.first&&entry.second.state!=WayWinWire::Hidden){entry.second.first=false;if(entry.second.state==WayWinWire::Background)backgroundCursor=entry.first;cursor=entry.first;return cursor;}
++        auto eligible=[&](const auto&e){return priority?e.second.state==wanted:e.second.state!=WayWinWire::Hidden;};
++        auto it=targets.upper_bound(priority?backgroundCursor:cursor);
++        for(size_t i=0;i<targets.size();++i){if(it==targets.end())it=targets.begin();if(eligible(*it)){cursor=it->first;if(priority&&wanted==WayWinWire::Background)backgroundCursor=cursor;return cursor;}++it;}
++        return 0;
++    }
++};
++class CaptureDeadline {
++    bool working=false,disabled=false;
++    uint64_t since=0;
++public:
++    bool available()const{return !working&&!disabled;}
++    bool busy()const{return working;}
++    bool start(uint64_t now){if(!available())return false;working=true;since=now;return true;}
++    void complete(){working=false;}
++    bool expired(uint64_t now)const{return working&&now-since>=StallMs;}
++    void fault(){working=false;disabled=true;}
++    void reopen(){disabled=false;}
++};
++}
+--- /dev/null
 +++ b/client/SDL/SDL3/waywin_product.cpp
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,246 @@
 +// SPDX-License-Identifier: Apache-2.0
 +#include "waywin_product.hpp"
 +#include "sdl_context.hpp"
++#include "waywin_policy.hpp"
 +#include <freerdp/dvc.h>
 +#include <freerdp/client/channels.h>
 +#include <freerdp/error.h>
@@ -441,7 +590,10 @@
 +static std::atomic<bool> readerStarted{false},retryPaused{false};
 +static std::mutex commandsLock,channelLock,outputLock;
 +struct Command {unsigned action,window,icon,epoch;std::string payload;};
-+static std::deque<Command> commands;
++static WayWinPolicy::Queue commands;
++static WayWinPolicy::Stall commandStall;
++static bool commandsLow=true;
++static std::atomic<bool> queueFatal{false};
 +static IWTSVirtualChannel* activeChannel=nullptr;
 +struct Picture {SDL_Window*window;SDL_Texture*texture;};
 +static std::map<SDL_Renderer*,Picture> pictures;
@@ -457,7 +609,7 @@
 +static UINT received(IWTSVirtualChannelCallback* base,wStream* stream) {
 +    auto*c=reinterpret_cast<Callback*>(base);
 +    try {for(auto m:c->decoder.feed(static_cast<const uint8_t*>(Stream_ConstPointer(stream)),Stream_GetRemainingLength(stream))) {
-+        if(m.type<Ready||m.type>SurfaceGone||m.epoch!=c->epoch)continue;
++        if(m.type<Ready||m.type>InputAck||m.epoch!=c->epoch)continue;
 +        waywinEmit(std::move(m));
 +    }}catch(...){return ERROR_INVALID_DATA;}
 +    return CHANNEL_RC_OK;
@@ -466,7 +618,7 @@
 +    auto*c=reinterpret_cast<Callback*>(base);
 +    {std::lock_guard<std::mutex>lock(channelLock);activeChannel=c->channel;c->epoch=++waywinEpoch;}
 +    Message state{Channel,0,c->epoch,{}};put(state.data,1);waywinEmit(std::move(state));
-+    auto hello=encode({Hello,1,c->epoch,{}});
++    Message request{Hello,1,c->epoch,{}};put(request.data,RequestedCapabilities);auto hello=encode(request);
 +    return c->channel->Write(c->channel,static_cast<ULONG>(hello.size()),hello.data(),nullptr);
 +}
 +static UINT closed(IWTSVirtualChannelCallback*base) {
@@ -497,21 +649,40 @@
 +    return freerdp_channels_load_static_addin_entry(name,subsystem,type,flags);
 +}
 +void waywinRegister(){if(std::getenv("WAYWIN_PRODUCT"))std::ignore=freerdp_register_addin_provider(provider,0);}
++static void queueFlow(unsigned state) {
++    Message m{Flow,0,waywinEpoch.load(),{}};put(m.data,2);put(m.data,state);waywinEmit(std::move(m));
++}
 +void waywinStartCommands() {
 +    if(!std::getenv("WAYWIN_PRODUCT")||readerStarted.exchange(true))return;
 +    std::thread([]{
-+        std::string line;bool drop=false;char c=0;
++        std::string line;char c=0;
 +        while(::read(STDIN_FILENO,&c,1)==1) {
 +            if(c=='\n') {
-+                if(!drop) {
-+                    std::istringstream input(line);Command cmd{};std::string extra;
-+                    if((input>>cmd.action>>cmd.window>>cmd.icon>>cmd.epoch>>cmd.payload)&&!(input>>extra)) {
-+                        if(cmd.action==21||cmd.action==22||cmd.action==23)retryAction=cmd.action;
-+                        else {std::lock_guard<std::mutex>lock(commandsLock);if(commands.size()<128)commands.push_back(std::move(cmd));}
++                try {
++                    auto packet=WayWinPolicy::commandPacket(line);
++                    std::istringstream input(line);Command cmd{};input>>cmd.action>>cmd.window>>cmd.icon>>cmd.epoch>>cmd.payload;
++                    if(cmd.epoch==waywinEpoch) {
++                        if(cmd.action==23){unsigned idle=0;retryAction.compare_exchange_strong(idle,23);}
++                        else if(cmd.action==21||cmd.action==22)retryAction=cmd.action;
++                        else {
++                            WayWinPolicy::Admission admitted;uint32_t replaced=0;bool notify=false,loadChanged=false;
++                            {std::lock_guard<std::mutex>lock(commandsLock);
++                                admitted=commands.push(std::move(packet));replaced=commands.replacedRequest;loadChanged=commandsLow&&!commands.low();commandsLow=commands.low();
++                                if(admitted!=WayWinPolicy::Admission::Accepted||commands.high()){notify=!commandStall.active();commandStall.set(true,SDL_GetTicks());}
++                                // Serialize watermark notifications with queue changes so a
++                                // late blocked event cannot overtake a subsequent resume.
++                                if(admitted==WayWinPolicy::Admission::ControlFull){queueFatal=true;queueFlow(2);}
++                                else if(notify)queueFlow(1);
++                                else if(loadChanged)queueFlow(3);
++                            }
++                            if(replaced)waywinEmit({InputAck,replaced,cmd.epoch,{}});
++                        }
 +                    }
-+                }
-+                line.clear();drop=false;
-+            }else if(line.size()<2*(Maximum+24)+128)line+=c;else drop=true;
++                }catch(...){queueFatal=true;queueFlow(2);}
++                line.clear();
++            }else if(line.size()<WayWinPolicy::CommandLineBytes)line+=c;else {queueFatal=true;queueFlow(2);break;}
++            bool expired=false;{std::lock_guard<std::mutex>lock(commandsLock);expired=commandStall.expired(SDL_GetTicks());}
++            if(expired){queueFatal=true;queueFlow(2);break;}
 +        }
 +    }).detach();
 +}
@@ -568,13 +739,21 @@
 +}
 +void waywinTick(SdlContext*sdl) {
 +    if(!std::getenv("WAYWIN_PRODUCT"))return;
-+    std::deque<Command>pending;{std::lock_guard<std::mutex>lock(commandsLock);pending.swap(commands);}
-+    for(const auto&c:pending) {
++    if(queueFatal)return;
++    for(;;) {
++        std::string line;bool resumed=false;uint32_t completion=0;
++        {std::lock_guard<std::mutex>lock(commandsLock);
++            if(commands.empty())break;
++            completion=commands.front().request;line=std::move(commands.front().bytes);commands.pop();
++            if(commands.low()&&(commandStall.active()||!commandsLow)){commandStall.set(false,SDL_GetTicks());resumed=true;}commandsLow=commands.low();
++            if(resumed)queueFlow(0);
++        }
++        Command c{};std::istringstream input(line);input>>c.action>>c.window>>c.icon>>c.epoch>>c.payload;
 +        if(c.epoch!=waywinEpoch||waywinRecovering)continue;
-+        if(c.action>=1&&c.action<=6)sdl->getRailChannelContext().productCommand(c.action,c.window,c.icon);
++        if(c.action>=1&&c.action<=6){sdl->getRailChannelContext().productCommand(c.action,c.window,c.icon);if(completion)waywinEmit({InputAck,completion,c.epoch,{}});}
 +        else if(c.action==20)try {
 +            auto bytes=unhex(c.payload);Decoder decoder;auto messages=decoder.feed(bytes.data(),bytes.size());
-+            if(messages.size()!=1||encode(messages[0])!=bytes||!requestType(messages[0].type)||messages[0].epoch!=waywinEpoch)continue;
++            if(messages.size()!=1||messages[0].epoch!=waywinEpoch)continue;
 +            std::lock_guard<std::mutex>lock(channelLock);
 +            if(activeChannel)std::ignore=activeChannel->Write(activeChannel,static_cast<ULONG>(bytes.size()),bytes.data(),nullptr);
 +        }catch(...){}
@@ -590,6 +769,10 @@
 +        error==FREERDP_ERROR_DNS_ERROR;
 +}
 +static void retryStatus(unsigned state,unsigned attempt,unsigned seconds,unsigned error) {
++    static std::mutex statusLock;static unsigned previous[4]={~0u,~0u,~0u,~0u};
++    std::lock_guard<std::mutex>guard(statusLock);
++    if(previous[0]==state&&previous[1]==attempt&&previous[2]==seconds&&previous[3]==error)return;
++    previous[0]=state;previous[1]=attempt;previous[2]=seconds;previous[3]=error;
 +    Message m{Retry,0,waywinEpoch.load(),{}};put(m.data,state);put(m.data,attempt);put(m.data,seconds);put(m.data,error);waywinEmit(std::move(m));
 +}
 +bool waywinReconnect(freerdp*instance) {
@@ -599,36 +782,29 @@
 +    // Never replay RemoteApplicationProgram after the initial connection.
 +    std::ignore=freerdp_settings_set_string(instance->context->settings,FreeRDP_RemoteApplicationProgram,"");
 +    std::mt19937 random(std::random_device{}());
-+    unsigned attempt=0;
++    WayWinPolicy::RetryBudget budget;
++    auto delay=[&](unsigned attempt){return (1u<<attempt)*static_cast<unsigned>(std::uniform_int_distribution<int>(800,1200)(random));};
++    budget.disconnected(SDL_GetTicks(),delay(0));
 +    for(;;) {
-+        if(retryAction==22||attempt>=5) {
-+            retryPaused=true;retryAttempt=5;retrySeconds=0;retryStatus(2,attempt,0,freerdp_get_last_error(instance->context));
-+            while(retryAction!=21&&retryAction!=23) {
-+                if(freerdp_get_last_error(instance->context)==FREERDP_ERROR_CONNECT_CANCELLED){waywinRecovering=false;return false;}
-+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-+            }
-+            attempt=0;retryPaused=false;
-+        }
-+        bool immediate=retryAction==21||retryAction==23;retryAction=0;
-+        retryAttempt=++attempt;
-+        auto milliseconds=immediate?0:static_cast<unsigned>((1u<<(attempt-1))*std::uniform_int_distribution<int>(800,1200)(random));
-+        auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(milliseconds);
-+        while(std::chrono::steady_clock::now()<deadline) {
-+            if(retryAction)break;
-+            retrySeconds=static_cast<unsigned>(std::chrono::duration_cast<std::chrono::seconds>(deadline-std::chrono::steady_clock::now()).count()+1);
-+            retryStatus(1,attempt,retrySeconds,0);std::this_thread::sleep_for(std::chrono::milliseconds(250));
-+        }
-+        if(retryAction==22)continue;
-+        if(retryAction==21||retryAction==23){attempt=0;continue;}
++        const auto action=retryAction.exchange(0);const auto now=SDL_GetTicks();
++        if(action==22)budget.stop();
++        else if(action==21)budget.manual(now);
++        else if(action==23)budget.wake(now);
++        retryPaused=budget.state!=WayWinPolicy::RetryState::Automatic;
++        retryAttempt=budget.attempts;
 +        if(freerdp_get_last_error(instance->context)==FREERDP_ERROR_CONNECT_CANCELLED){waywinRecovering=false;return false;}
-+        retrySeconds=0;retryStatus(1,attempt,0,0);
++        if(retryPaused){retrySeconds=0;retryStatus(budget.state==WayWinPolicy::RetryState::Stopped?2:5,budget.attempts,0,freerdp_get_last_error(instance->context));std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
++        if(now<budget.due){retrySeconds=static_cast<unsigned>((budget.due-now+999)/1000);retryStatus(1,budget.attempts,retrySeconds,0);std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
++        if(!budget.begin(now))continue;
++        retryAttempt=budget.attempts;retrySeconds=0;retryStatus(1,budget.attempts,0,0);
 +        std::mutex lock;std::condition_variable done;bool finished=false;std::atomic<bool> timedOut{false};
 +        std::thread watchdog([&]{std::unique_lock<std::mutex>guard(lock);if(!done.wait_for(guard,std::chrono::seconds(9),[&]{return finished;})){timedOut=true;std::ignore=freerdp_abort_connect_context(instance->context);}});
 +        const bool connected=freerdp_reconnect(instance);
 +        {std::lock_guard<std::mutex>guard(lock);finished=true;}done.notify_one();watchdog.join();
-+        if(connected){{std::lock_guard<std::mutex>guard(commandsLock);commands.clear();}waywinRecovering=false;retryStatus(0,attempt,0,0);return true;}
++        if(connected){{std::lock_guard<std::mutex>guard(commandsLock);commands.clear();commandsLow=true;commandStall.set(false,SDL_GetTicks());}budget.succeeded();waywinRecovering=false;retryStatus(0,retryAttempt,0,0);return true;}
 +        if(timedOut)freerdp_set_last_error(instance->context,FREERDP_ERROR_CONNECT_TRANSPORT_FAILED);
-+        if(!networkFailure(instance)){retryStatus(3,attempt,0,freerdp_get_last_error(instance->context));waywinRecovering=false;return false;}
++        if(!networkFailure(instance)){budget.forbid();retryStatus(3,budget.attempts,0,freerdp_get_last_error(instance->context));waywinRecovering=false;return false;}
++        budget.failed(SDL_GetTicks(),delay(budget.attempts));
 +    }
 +}
 --- /dev/null
@@ -653,7 +829,7 @@
 +void waywinEmit(WayWinWire::Message);
 --- /dev/null
 +++ b/client/SDL/SDL3/waywin_wire.hpp
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,58 @@
 +// SPDX-License-Identifier: Apache-2.0
 +#pragma once
 +#include <cstdint>
@@ -664,9 +840,13 @@
 +namespace WayWinWire {
 +constexpr uint32_t Magic=0x32575759, Maximum=2*1024*1024;
 +enum Type : uint32_t { Hello=1, Apps=2, Launch=3, Shell=4, ClipboardGet=5, ClipboardSet=6,
-+    Pointer=7, Key=8, SurfaceClose=9, Text=10,
++    Pointer=7, Key=8, SurfaceClose=9, Text=10, SurfaceState=11,
 +    Ready=101, AppList=102, Result=103, Frame=104, Clipboard=105, SurfaceGone=106,
-+    Channel=107, Title=108, Icon=109, Retry=110, Fault=111, TrayTitle=112 };
++    Channel=107, Title=108, Icon=109, Retry=110, Fault=111, TrayTitle=112,
++    InputAck=113, Flow=114 };
++constexpr uint32_t SurfacePriority=0x40, InputCompletion=0x80;
++constexpr uint32_t RequestedCapabilities=SurfacePriority|InputCompletion;
++enum Visibility : uint32_t { Hidden=0, Background=1, Active=2 };
 +struct Message { uint32_t type=0,request=0,epoch=0;std::vector<uint8_t> data; };
 +inline void put(std::vector<uint8_t>&b,uint32_t n){for(int i=0;i<4;++i)b.push_back(uint8_t(n>>(8*i)));}
 +inline uint32_t get(const uint8_t*p){return uint32_t(p[0])|(uint32_t(p[1])<<8)|(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24);}
@@ -680,8 +860,8 @@
 +    bool done()const{return p==b.size();}
 +    size_t position()const{return p;}
 +};
-+inline bool requestType(uint32_t t){return t>=Hello&&t<=Text;}
-+inline bool responseType(uint32_t t){return t>=Ready&&t<=TrayTitle;}
++inline bool requestType(uint32_t t){return t>=Hello&&t<=SurfaceState;}
++inline bool responseType(uint32_t t){return t>=Ready&&t<=Flow;}
 +inline std::vector<uint8_t> encode(const Message&m){
 +    if(m.data.size()>Maximum)throw std::runtime_error("oversized frame");
 +    std::vector<uint8_t>b;b.reserve(24+m.data.size());put(b,Magic);put(b,2);put(b,m.type);put(b,m.request);put(b,m.epoch);put(b,uint32_t(m.data.size()));b.insert(b.end(),m.data.begin(),m.data.end());return b;

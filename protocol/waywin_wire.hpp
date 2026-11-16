@@ -8,9 +8,13 @@
 namespace WayWinWire {
 constexpr uint32_t Magic=0x32575759, Maximum=2*1024*1024;
 enum Type : uint32_t { Hello=1, Apps=2, Launch=3, Shell=4, ClipboardGet=5, ClipboardSet=6,
-    Pointer=7, Key=8, SurfaceClose=9, Text=10,
+    Pointer=7, Key=8, SurfaceClose=9, Text=10, SurfaceState=11,
     Ready=101, AppList=102, Result=103, Frame=104, Clipboard=105, SurfaceGone=106,
-    Channel=107, Title=108, Icon=109, Retry=110, Fault=111, TrayTitle=112 };
+    Channel=107, Title=108, Icon=109, Retry=110, Fault=111, TrayTitle=112,
+    InputAck=113, Flow=114 };
+constexpr uint32_t SurfacePriority=0x40, InputCompletion=0x80;
+constexpr uint32_t RequestedCapabilities=SurfacePriority|InputCompletion;
+enum Visibility : uint32_t { Hidden=0, Background=1, Active=2 };
 struct Message { uint32_t type=0,request=0,epoch=0;std::vector<uint8_t> data; };
 inline void put(std::vector<uint8_t>&b,uint32_t n){for(int i=0;i<4;++i)b.push_back(uint8_t(n>>(8*i)));}
 inline uint32_t get(const uint8_t*p){return uint32_t(p[0])|(uint32_t(p[1])<<8)|(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24);}
@@ -24,8 +28,8 @@ public:
     bool done()const{return p==b.size();}
     size_t position()const{return p;}
 };
-inline bool requestType(uint32_t t){return t>=Hello&&t<=Text;}
-inline bool responseType(uint32_t t){return t>=Ready&&t<=TrayTitle;}
+inline bool requestType(uint32_t t){return t>=Hello&&t<=SurfaceState;}
+inline bool responseType(uint32_t t){return t>=Ready&&t<=Flow;}
 inline std::vector<uint8_t> encode(const Message&m){
     if(m.data.size()>Maximum)throw std::runtime_error("oversized frame");
     std::vector<uint8_t>b;b.reserve(24+m.data.size());put(b,Magic);put(b,2);put(b,m.type);put(b,m.request);put(b,m.epoch);put(b,uint32_t(m.data.size()));b.insert(b.end(),m.data.begin(),m.data.end());return b;

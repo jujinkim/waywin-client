@@ -15,6 +15,8 @@
 #include <set>
 #include <memory>
 #include "waywin_wire.hpp"
+#include "capture_worker.h"
+#include "waywin_policy.hpp"
 using namespace WayWinWire;
 namespace fs=std::filesystem;
 static HWND mainWindow=nullptr,statusLabel=nullptr;
@@ -22,16 +24,17 @@ static DWORD sessionId=0;
 static std::string identity;
 static std::atomic<bool> running{true},linked{false};
 static std::mutex queueLock;
-static std::deque<Message> inbound,outbound;
+static WayWinPolicy::Queue inbound;
+static std::deque<Message> outbound;
 static std::map<uint32_t,fs::path> apps;
 static std::map<uint32_t,HWND> surfaces;
 static uint32_t epoch=0,nextSurface=0;
 static std::map<uint32_t,uint32_t> surfaceKinds;
 static std::map<uint32_t,std::pair<uint32_t,ULONGLONG>> seeking;
 static std::set<WORD> heldKeys;
-static std::atomic<bool> captureBusy{false};
-static ULONGLONG captureStarted=0;
-static std::set<uint32_t> captureWarnings;
+static CaptureProcess captureProcess;
+static WayWinPolicy::CaptureScheduler captureSchedule;
+static std::atomic<uint32_t> negotiated{0};
 static unsigned heldMouse=0;
 static std::wstring wide(const std::string&s) {
     if(s.empty())return {};
@@ -52,6 +55,9 @@ static void send(Message m) {
 static void result(const Message&m,uint32_t code,const std::string&text) {
     Message r{Result,m.request,m.epoch,{}};put(r.data,code);string(r.data,text);send(std::move(r));
 }
+static void acknowledge(const Message&m) {
+    if((negotiated&InputCompletion)&&(WayWinPolicy::input(m.type)||m.type==SurfaceClose||m.type==SurfaceState))send({InputAck,m.request,m.epoch,{}});
+}
 static void releaseKeys() {
     for(WORD key:heldKeys){INPUT i{};i.type=INPUT_KEYBOARD;i.ki.wVk=key;i.ki.dwFlags=KEYEVENTF_KEYUP;SendInput(1,&i,sizeof(i));}
     heldKeys.clear();
@@ -61,79 +67,6 @@ static void keyStroke(WORD key,bool down) {
     INPUT i{};i.type=INPUT_KEYBOARD;i.ki.wVk=key;i.ki.dwFlags=down?0:KEYEVENTF_KEYUP;
     if(SendInput(1,&i,sizeof(i))!=1)throw std::runtime_error("Windows blocked input; check foreground desktop and integrity level.");
     if(down)heldKeys.insert(key);else heldKeys.erase(key);
-}
-static bool shellAllowed(HWND w,uint32_t kind) {
-    if(!IsWindowVisible(w)||IsIconic(w))return false;
-    DWORD pid=0,sid=0;GetWindowThreadProcessId(w,&pid);if(!ProcessIdToSessionId(pid,&sid)||sid!=sessionId)return false;
-    BOOL cloaked=FALSE;DwmGetWindowAttribute(w,DWMWA_CLOAKED,&cloaked,sizeof(cloaked));if(cloaked)return false;
-    HANDLE p=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);if(!p)return false;
-    wchar_t path[32768]{};DWORD n=32768;bool ok=QueryFullProcessImageNameW(p,0,path,&n)!=0;CloseHandle(p);if(!ok)return false;
-    std::wstring name=fs::path(path).filename().wstring();std::transform(name.begin(),name.end(),name.begin(),towlower);
-    if(kind==1)return name==L"startmenuexperiencehost.exe";
-    if(kind==2) {
-        if(name==L"systemsettings.exe")return true;
-        if(name==L"applicationframehost.exe") {
-            bool settings=false;
-            EnumChildWindows(w,[](HWND child,LPARAM arg)->BOOL{
-                DWORD owner=0;GetWindowThreadProcessId(child,&owner);HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,owner);
-                if(process){wchar_t path[32768]{};DWORD count=32768;if(QueryFullProcessImageNameW(process,0,path,&count)&&_wcsicmp(fs::path(path).filename().c_str(),L"SystemSettings.exe")==0)*reinterpret_cast<bool*>(arg)=true;CloseHandle(process);}return TRUE;
-            },reinterpret_cast<LPARAM>(&settings));
-            return settings;
-        }
-        return false;
-    }
-    if(kind==4)return name==L"textinputhost.exe"||name==L"inputapp.exe";
-    if(kind==3) {
-        if(name==L"shellexperiencehost.exe")return true;
-        wchar_t cls[256]{};GetClassNameW(w,cls,256);
-        return name==L"explorer.exe"&&(wcscmp(cls,L"ControlCenterWindow")==0||wcscmp(cls,L"XamlExplorerHostIslandWindow")==0);
-    }
-    return false;
-}
-static std::vector<uint8_t> capture(HWND w,IWICImagingFactory*imaging) {
-    RECT rc{};if(!GetWindowRect(w,&rc))return {};
-    const int width=rc.right-rc.left,height=rc.bottom-rc.top;
-    if(width<=0||height<=0||width>8192||height>8192)return {};
-    HDC screen=GetDC(nullptr),mem=CreateCompatibleDC(screen);
-    HBITMAP bitmap=CreateCompatibleBitmap(screen,width,height);HGDIOBJ old=SelectObject(mem,bitmap);
-    // PrintWindow captures only this approved shell HWND; never copy the whole desktop.
-    BOOL ok=PrintWindow(w,mem,2);SelectObject(mem,old);DeleteDC(mem);ReleaseDC(nullptr,screen);
-    if(!ok){DeleteObject(bitmap);return {};}
-    IWICBitmap* source=nullptr;IWICBitmapScaler* scaler=nullptr;IWICFormatConverter* convert=nullptr;
-    IStream* stream=nullptr;IWICBitmapEncoder* encoder=nullptr;IWICBitmapFrameEncode* frame=nullptr;
-    std::vector<uint8_t> bytes;
-    const UINT outW=UINT(std::min(width,1600)),outH=UINT((int64_t(height)*outW)/width);
-    HRESULT hr=imaging->CreateBitmapFromHBITMAP(bitmap,nullptr,WICBitmapIgnoreAlpha,&source);
-    if(SUCCEEDED(hr))hr=imaging->CreateBitmapScaler(&scaler);
-    if(SUCCEEDED(hr))hr=scaler->Initialize(source,outW,outH,WICBitmapInterpolationModeFant);
-    if(SUCCEEDED(hr))hr=imaging->CreateFormatConverter(&convert);
-    if(SUCCEEDED(hr))hr=convert->Initialize(scaler,GUID_WICPixelFormat24bppBGR,WICBitmapDitherTypeNone,nullptr,0,WICBitmapPaletteTypeCustom);
-    if(SUCCEEDED(hr))hr=CreateStreamOnHGlobal(nullptr,TRUE,&stream);
-    if(SUCCEEDED(hr))hr=imaging->CreateEncoder(GUID_ContainerFormatJpeg,nullptr,&encoder);
-    if(SUCCEEDED(hr))hr=encoder->Initialize(stream,WICBitmapEncoderNoCache);
-    if(SUCCEEDED(hr))hr=encoder->CreateNewFrame(&frame,nullptr);
-    if(SUCCEEDED(hr))hr=frame->Initialize(nullptr);
-    if(SUCCEEDED(hr))hr=frame->SetSize(outW,outH);
-    WICPixelFormatGUID format=GUID_WICPixelFormat24bppBGR;
-    if(SUCCEEDED(hr))hr=frame->SetPixelFormat(&format);
-    if(SUCCEEDED(hr))hr=frame->WriteSource(convert,nullptr);
-    if(SUCCEEDED(hr))hr=frame->Commit();
-    if(SUCCEEDED(hr))hr=encoder->Commit();
-    if(SUCCEEDED(hr)) {
-        STATSTG stat{};hr=stream->Stat(&stat,STATFLAG_NONAME);
-        if(SUCCEEDED(hr)&&stat.cbSize.QuadPart<Maximum-16) {
-            LARGE_INTEGER zero{};stream->Seek(zero,STREAM_SEEK_SET,nullptr);
-            bytes.resize(size_t(stat.cbSize.QuadPart));ULONG got=0;
-            if(FAILED(stream->Read(bytes.data(),ULONG(bytes.size()),&got))||got!=bytes.size())bytes.clear();
-        }
-    }
-    if(frame)frame->Release();
-    if(encoder)encoder->Release();
-    if(stream)stream->Release();
-    if(convert)convert->Release();
-    if(scaler)scaler->Release();
-    if(source)source->Release();
-    DeleteObject(bitmap);return bytes;
 }
 static void enumerateApps(const Message&m) {
     apps.clear();uint32_t id=0;Message r{AppList,m.request,m.epoch,{}};put(r.data,0);
@@ -155,7 +88,12 @@ static void enumerateApps(const Message&m) {
 }
 static void handle(const Message&m) {
     if(!requestType(m.type)||!m.request)return;
-    if(m.type==Hello){epoch=m.epoch;Message r{Ready,m.request,m.epoch,{}};put(r.data,sessionId);string(r.data,identity);put(r.data,0x3f);send(std::move(r));return;}
+    if(m.type==Hello){
+        Reader read(m.data);auto requested=read.done()?0:read.number();if(!read.done())throw std::runtime_error("Invalid capabilities");
+        if(epoch!=m.epoch){releaseKeys();surfaces.clear();surfaceKinds.clear();seeking.clear();captureSchedule.clear();captureProcess.stop();}
+        epoch=m.epoch;negotiated=requested&RequestedCapabilities;
+        Message r{Ready,m.request,m.epoch,{}};put(r.data,sessionId);string(r.data,identity);put(r.data,0x3f|RequestedCapabilities);send(std::move(r));return;
+    }
     if(m.epoch!=epoch){result(m,2,"Stale channel generation");return;}
     Reader read(m.data);
     if(m.type==Apps){if(!read.done())throw std::runtime_error("invalid list request");enumerateApps(m);return;}
@@ -166,7 +104,7 @@ static void handle(const Message&m) {
     }
     if(m.type==WayWinWire::Shell) {
         uint32_t kind=read.number();if(!read.done()||kind<1||kind>4)throw std::runtime_error("Unknown shell surface");
-        releaseKeys();
+        releaseKeys();captureProcess.reopen();
         if(kind==2) {
             if(reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr,L"open",L"ms-settings:regionlanguage",nullptr,nullptr,SW_SHOWNORMAL))<=32)throw std::runtime_error("Windows settings unavailable");
         } else if(kind!=4) {
@@ -193,9 +131,13 @@ static void handle(const Message&m) {
         result(m,ok?0:1,ok?"Text sent to this Windows session":"Clipboard update failed");return;
     }
     auto id=read.number();
+    if(m.type==SurfaceState){
+        auto value=read.number();if(!read.done()||value>Active||!surfaces.count(id)||!(negotiated&SurfacePriority))throw std::runtime_error("Invalid surface state");
+        captureSchedule.state(id,value);acknowledge(m);return;
+    }
     if(!surfaces.count(id)||!shellAllowed(surfaces[id],surfaceKinds[id]))throw std::runtime_error("Shell surface closed or inaccessible");
     HWND w=surfaces[id];
-    if(m.type==SurfaceClose){if(!read.done())throw std::runtime_error("Invalid close request");releaseKeys();if(surfaceKinds[id]==2)PostMessageW(w,WM_CLOSE,0,0);else if(surfaceKinds[id]==4||SetForegroundWindow(w)){keyStroke(VK_ESCAPE,true);keyStroke(VK_ESCAPE,false);}surfaces.erase(id);surfaceKinds.erase(id);return;}
+    if(m.type==SurfaceClose){if(!read.done())throw std::runtime_error("Invalid close request");releaseKeys();if(surfaceKinds[id]==2)PostMessageW(w,WM_CLOSE,0,0);else if(surfaceKinds[id]==4||SetForegroundWindow(w)){keyStroke(VK_ESCAPE,true);keyStroke(VK_ESCAPE,false);}surfaces.erase(id);surfaceKinds.erase(id);captureSchedule.remove(id);send({SurfaceGone,id,m.epoch,{}});acknowledge(m);return;}
     if(surfaceKinds[id]!=4&&GetAncestor(GetForegroundWindow(),GA_ROOT)!=w&&!SetForegroundWindow(w))throw std::runtime_error("Windows denied shell focus; reopen the surface.");
     if(m.type==Pointer) {
         auto x=read.number(),y=read.number(),action=read.number();if(!read.done()||x>65535||y>65535||action>7)throw std::runtime_error("Invalid pointer request");
@@ -219,46 +161,44 @@ static void handle(const Message&m) {
         auto value=wide(read.text(4096));if(!read.done())throw std::runtime_error("Invalid text");
         for(wchar_t c:value){INPUT i[2]{};i[0].type=i[1].type=INPUT_KEYBOARD;i[0].ki.wScan=i[1].ki.wScan=WORD(c);i[0].ki.dwFlags=KEYEVENTF_UNICODE;i[1].ki.dwFlags=KEYEVENTF_UNICODE|KEYEVENTF_KEYUP;if(SendInput(2,i,sizeof(INPUT))!=2)throw std::runtime_error("Windows denied text input");}
     } else throw std::runtime_error("Unsupported operation");
+    acknowledge(m);
 }
 static void tick() {
-    std::deque<Message> messages;{std::lock_guard<std::mutex>lock(queueLock);messages.swap(inbound);}
-    if(!linked){messages.clear();surfaces.clear();surfaceKinds.clear();seeking.clear();releaseKeys();}
-    for(const auto&m:messages)try{handle(m);}catch(const std::exception&e){if(m.type==Pointer||m.type==Key||m.type==Text)releaseKeys();result(m,1,e.what());}
+    std::deque<Message> messages;
+    {std::lock_guard<std::mutex>lock(queueLock);
+        while(!inbound.empty()){const auto &bytes=inbound.front().bytes;Decoder decoder;auto decoded=decoder.feed(reinterpret_cast<const uint8_t*>(bytes.data()),bytes.size());if(decoded.size()==1)messages.push_back(std::move(decoded[0]));inbound.pop();}
+    }
+    if(!linked){messages.clear();surfaces.clear();surfaceKinds.clear();seeking.clear();captureSchedule.clear();captureProcess.stop();releaseKeys();}
+    for(const auto&m:messages)try{handle(m);}catch(const std::exception&e){if(WayWinPolicy::input(m.type))releaseKeys();result(m,1,e.what());}
     for(auto it=seeking.begin();it!=seeking.end();) {
         struct Search {uint32_t kind;HWND found;};Search find{it->second.first,nullptr};
         EnumWindows([](HWND w,LPARAM arg)->BOOL{auto&s=*reinterpret_cast<Search*>(arg);if(shellAllowed(w,s.kind)){s.found=w;return FALSE;}return TRUE;},reinterpret_cast<LPARAM>(&find));
-        if(find.found){uint32_t id=0;for(const auto&entry:surfaces)if(entry.second==find.found)id=entry.first;if(!id&&surfaces.size()>=8){Message m{WayWinWire::Shell,it->first,epoch,{}};result(m,1,"Close an existing shell surface first.");it=seeking.erase(it);continue;}if(!id)id=++nextSurface;surfaces[id]=find.found;surfaceKinds[id]=find.kind;Message r{Result,it->first,epoch,{}};put(r.data,0);string(r.data,"Original Windows UI opened");send(std::move(r));it=seeking.erase(it);}
+        if(find.found){uint32_t id=0;for(const auto&entry:surfaces)if(entry.second==find.found)id=entry.first;if(!id&&surfaces.size()>=8){Message m{WayWinWire::Shell,it->first,epoch,{}};result(m,1,"Close an existing shell surface first.");it=seeking.erase(it);continue;}if(!id)id=++nextSurface;surfaces[id]=find.found;surfaceKinds[id]=find.kind;captureSchedule.add(id);Message r{Result,it->first,epoch,{}};put(r.data,0);string(r.data,"Original Windows UI opened");send(std::move(r));it=seeking.erase(it);}
         else if(GetTickCount64()>it->second.second){Message m{WayWinWire::Shell,it->first,epoch,{}};result(m,1,"Windows did not expose this shell UI. Check edition, shell session, and supported RemoteApp configuration.");it=seeking.erase(it);}
         else ++it;
     }
     for(auto it=surfaces.begin();it!=surfaces.end();) {
         auto id=it->first;
-        if(!shellAllowed(it->second,surfaceKinds[id])){releaseKeys();Message m{SurfaceGone,id,epoch,{}};send(std::move(m));surfaceKinds.erase(id);it=surfaces.erase(it);continue;}
+        if(!shellAllowed(it->second,surfaceKinds[id])){releaseKeys();Message m{SurfaceGone,id,epoch,{}};send(std::move(m));surfaceKinds.erase(id);captureSchedule.remove(id);it=surfaces.erase(it);continue;}
         ++it;
     }
-    if(!surfaces.empty()&&!captureBusy.exchange(true)) {
-        captureStarted=GetTickCount64();
-        const auto targets=surfaces;const auto kinds=surfaceKinds;const auto generation=epoch;
-        std::thread([targets,kinds,generation]{
-            if(SUCCEEDED(CoInitializeEx(nullptr,COINIT_MULTITHREADED))) {
-                IWICImagingFactory* factory=nullptr;
-                if(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&factory)))) {
-                    for(const auto&[id,window]:targets) {
-                        if(!running||!linked||!shellAllowed(window,kinds.at(id)))continue;
-                        auto bytes=capture(window,factory);RECT r{};GetWindowRect(window,&r);
-                        if(!bytes.empty()) {
-                            Message m{Frame,id,generation,{}};put(m.data,kinds.at(id));put(m.data,uint32_t(r.right-r.left));put(m.data,uint32_t(r.bottom-r.top));m.data.insert(m.data.end(),bytes.begin(),bytes.end());send(std::move(m));
-                        } else {Message m{SurfaceGone,id,generation,{}};string(m.data,"Windows could not capture this shell surface.");send(std::move(m));}
-                    }
-                    factory->Release();
-                }
-                CoUninitialize();
-            }
-            captureBusy=false;
-        }).detach();
+    auto captureFault=[](){
+        releaseKeys();captureProcess.fault();
+        for(const auto&entry:surfaces){Message m{SurfaceGone,entry.first,epoch,{}};string(m.data,"Windows shell capture stopped (timeout, process exit, or IPC error). Reopen the shell to retry.");send(std::move(m));}
+        surfaces.clear();surfaceKinds.clear();seeking.clear();captureSchedule.clear();
+    };
+    Message frame;const auto now=GetTickCount64();const auto captured=captureProcess.poll(now,frame);
+    if(captured<0)captureFault();
+    else if(captured>0&&frame.epoch==epoch&&surfaces.count(frame.request)){
+        if(frame.type==SurfaceGone){
+            releaseKeys();string(frame.data,"Windows could not capture this shell surface. Reopen it to retry.");
+            surfaces.erase(frame.request);surfaceKinds.erase(frame.request);captureSchedule.remove(frame.request);
+        }
+        send(std::move(frame));
     }
-    if(captureBusy&&GetTickCount64()-captureStarted>5000) {
-        for(const auto&[id,window]:surfaces)if(captureWarnings.insert(id).second){(void)window;Message m{SurfaceGone,id,epoch,{}};string(m.data,"Windows shell capture timed out. Close or restart the unresponsive Windows shell.");send(std::move(m));}
+    if(captureProcess.available()){
+        const auto id=captureSchedule.take(now,(negotiated&SurfacePriority)!=0);
+        if(id&&surfaces.count(id)&&!captureProcess.submit(id,epoch,surfaceKinds.at(id),surfaces.at(id),now))captureFault();
     }
     SetWindowTextW(statusLabel,linked?L"Connected through the current RDP session. No extra network port.":L"Waiting for WayWin RDP connection. Sign into this Windows session first.");
 }
@@ -281,8 +221,12 @@ static void channelLoop() {
                 auto ptr=reinterpret_cast<const uint8_t*>(buffer)+sizeof(CHANNEL_PDU_HEADER);
                 auto messages=decoder.feed(ptr,count-sizeof(CHANNEL_PDU_HEADER));
                 std::lock_guard<std::mutex>lock(queueLock);
-                if(inbound.size()+messages.size()>128)break;
-                for(auto&m:messages)if(m.data.size()<=65552)inbound.push_back(std::move(m));else throw std::runtime_error("request limit");
+                for(auto&m:messages){
+                    if(!requestType(m.type)||m.data.size()>65552)throw std::runtime_error("request limit");
+                    auto encoded=encode(m);auto packet=WayWinPolicy::packet(std::string(encoded.begin(),encoded.end()),m);
+                    if(inbound.push(std::move(packet))!=WayWinPolicy::Admission::Accepted)throw std::runtime_error("queue limit");
+                    if(inbound.replacedRequest&&(negotiated&InputCompletion)){if(outbound.size()>=64)throw std::runtime_error("completion limit");outbound.push_back({InputAck,inbound.replacedRequest,m.epoch,{}});}
+                }
             }catch(...){break;}
         }
         linked=false;WTSVirtualChannelClose(channel);
@@ -315,16 +259,17 @@ static LRESULT CALLBACK procedure(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         auto info=L"Use a supported Windows Remote Desktop / RemoteApp configuration.\r\nNo system binary changes or policy bypasses are applied.\r\nShell images and clipboard text are transferred only on request.\r\nClose hides this app in the notification area.";
         CreateWindowW(L"STATIC",info,WS_CHILD|WS_VISIBLE,20,200,610,100,w,nullptr,nullptr,nullptr);
         NOTIFYICONDATAW tray{};tray.cbSize=sizeof(tray);tray.hWnd=w;tray.uID=1;tray.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP;tray.uCallbackMessage=WM_APP+1;tray.hIcon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(101));wcscpy_s(tray.szTip,L"WayWin Companion");Shell_NotifyIconW(NIM_ADD,&tray);
-        SetTimer(w,1,250,nullptr);return 0;}
+        SetTimer(w,1,50,nullptr);return 0;}
     case WM_TIMER:tick();return 0;
     case WM_COMMAND:switch(LOWORD(wp)){case 100:install(true);break;case 101:install(false);break;case 102:ShellExecuteW(w,L"open",L"ms-settings:remotedesktop",nullptr,nullptr,SW_SHOWNORMAL);break;case 103:DestroyWindow(w);break;}return 0;
     case WM_APP+1:if(lp==WM_LBUTTONUP||lp==WM_RBUTTONUP){ShowWindow(w,SW_SHOW);SetForegroundWindow(w);}return 0;
     case WM_CLOSE:ShowWindow(w,SW_HIDE);return 0;
-    case WM_DESTROY:{running=false;releaseKeys();NOTIFYICONDATAW tray{};tray.cbSize=sizeof(tray);tray.hWnd=w;tray.uID=1;Shell_NotifyIconW(NIM_DELETE,&tray);PostQuitMessage(0);return 0;}
+    case WM_DESTROY:{running=false;captureProcess.stop();releaseKeys();NOTIFYICONDATAW tray{};tray.cbSize=sizeof(tray);tray.hWnd=w;tray.uID=1;Shell_NotifyIconW(NIM_DELETE,&tray);PostQuitMessage(0);return 0;}
     default:return DefWindowProcW(w,msg,wp,lp);
     }
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR command,int show) {
+    if(wcscmp(command,L"--capture-worker")==0)return runCaptureWorker();
     ProcessIdToSessionId(GetCurrentProcessId(),&sessionId);
     std::wstring mutexName=L"Local\\WayWin.Companion."+std::to_wstring(sessionId);
     HANDLE single=CreateMutexW(nullptr,TRUE,mutexName.c_str());if(!single||GetLastError()==ERROR_ALREADY_EXISTS){if(single)CloseHandle(single);return 0;}

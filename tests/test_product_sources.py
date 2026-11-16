@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class ProductSourceTests(unittest.TestCase):
     def test_runtime_sources_match_shipped_patch(self):
         patch = (ROOT / "patches/freerdp-3.33.1-product.patch").read_text()
-        for local in ("runtime/waywin_product.cpp", "runtime/waywin_product.hpp", "protocol/waywin_wire.hpp"):
+        for local in ("runtime/waywin_product.cpp", "runtime/waywin_product.hpp", "protocol/waywin_wire.hpp", "protocol/waywin_policy.hpp"):
             name = "client/SDL/SDL3/" + Path(local).name
             match = re.search(r"^--- /dev/null\n\+\+\+ b/" + re.escape(name) + r"\n@@[^\n]*\n(.*?)(?=^--- |\Z)", patch, re.M | re.S)
             self.assertIsNotNone(match, local)
